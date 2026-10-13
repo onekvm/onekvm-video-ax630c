@@ -76,6 +76,7 @@ struct ax_source {
     uint64_t display_seq, display_read_seq, display_pts;
     uint64_t display_requested_ms, display_published_ms;
     uint64_t display_last_read_ms;
+    uint64_t display_stalled_since_ms;
     int display_placeholder;
     int cap_fd;
     int wake_fd;
@@ -308,6 +309,9 @@ static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
                                 uint32_t *stride, char *error, uint32_t cap,
                                 uint32_t timeout_ms);
 static void ax_requeue(struct ax_source *src);
+static int ax_capture_start(struct ax_source *src, uint32_t width, uint32_t height,
+                            char *error, uint32_t cap);
+static int ax_import_capture(struct ax_source *src, int venc_fd);
 
 static int32_t ax_source_display(void *source,
     const struct onekvm_video_display_request_v1 *request,
@@ -359,7 +363,8 @@ static int32_t ax_source_display(void *source,
                                now - src->display_published_ms >= 66)) {
             uint32_t budget = (uint32_t)(deadline - now);
             if (budget > 50) budget = 50;
-            if (ax_grab_frame_budget(src, &frame, &stride, error, cap, budget) == 0) {
+            int captured = ax_grab_frame_budget(src, &frame, &stride, error, cap, budget);
+            if (captured == 0) {
                 /* A 15 fps panel must not work through a 60 fps FIFO. Drop
                  * already completed older frames, keeping the newest borrow. */
                 for (unsigned skipped = 1; skipped < src->nbufs; skipped++) {
@@ -378,10 +383,27 @@ static int32_t ax_source_display(void *source,
                     ax_requeue(src);
                     available = 1;
                 }
+            } else if (captured == 2) {
+                uint32_t w, h, fps;
+                if (!src->display_stalled_since_ms)
+                    src->display_stalled_since_ms = ax_now_ms();
+                /* Published geometry can precede usable CSI. Recover the
+                 * dead DMA ring even when ReadEncodedVideo is never called.
+                 * Do not restart during bridge signal loss or a mode change. */
+                if (ax_now_ms() - src->display_stalled_since_ms >= 300 &&
+                    ax_hdmi_mode(&w, &h, &fps) == 0 &&
+                    w == src->width && h == src->height) {
+                    int import_fd = src->import_venc_fd;
+                    fprintf(stderr, "ax630c: display capture stalled, restarting DMA ring\n");
+                    if (ax_capture_start(src, w, h, error, cap) == 0 && import_fd >= 0)
+                        ax_import_capture(src, import_fd);
+                    src->display_stalled_since_ms = 0;
+                }
             }
         }
         pthread_mutex_lock(&src->display_lock);
         if (available && !atomic_load(&src->interrupted)) {
+            src->display_stalled_since_ms = 0;
             memcpy(data, src->display_rgb, AX_DISPLAY_BYTES);
             src->display_read_seq = src->display_seq;
             src->display_last_read_ms = ax_now_ms();
@@ -417,6 +439,7 @@ static void ax_release_imports(struct ax_source *src);
 static void ax_capture_stop(struct ax_source *src)
 {
     src->display_placeholder = 0;
+    src->display_stalled_since_ms = 0;
     unsigned int i;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
