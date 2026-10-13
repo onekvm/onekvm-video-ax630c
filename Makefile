@@ -8,7 +8,7 @@ LDFLAGS := -shared -pthread
 
 all: host
 
-host: build/ax630c.so build/abi-smoke build/no-signal-test build/display-test
+host: build/ax630c.so build/abi-smoke build/no-signal-test build/display-test build/display-capture-test
 
 build:
 	mkdir -p build
@@ -25,10 +25,14 @@ build/no-signal-test: tests/no-signal-test.c src/ax_no_signal.c src/ax_display.c
 build/display-test: tests/display-test.c src/ax_display.c src/ax_display.h | build
 	$(CC) -O2 -Wall -Wextra -Isrc -o $@ tests/display-test.c src/ax_display.c
 
+build/display-capture-test: tests/display-capture-test.c src/ax630c_video.c src/ax_no_signal.c src/ax_display.c | build
+	$(CC) $(CFLAGS) -pthread -Wl,--wrap=poll -Wl,--wrap=ioctl -o $@ tests/display-capture-test.c src/ax_no_signal.c src/ax_display.c
+
 smoke: host
 	./build/abi-smoke ./build/ax630c.so
 	./build/no-signal-test
 	./build/display-test
+	./build/display-capture-test
 
 clean:
 	rm -rf build

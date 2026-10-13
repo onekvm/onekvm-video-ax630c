@@ -69,12 +69,13 @@
 struct ax_source {
     char device[256];
     pthread_mutex_t lock;
-    /* Display waits must never hold the VIN/encoder lock. */
+    /* Long display waits release VIN; a short dequeue shares its lock. */
     pthread_mutex_t display_lock;
     pthread_cond_t display_cv;
     uint8_t display_rgb[AX_DISPLAY_BYTES];
     uint64_t display_seq, display_read_seq, display_pts;
     uint64_t display_requested_ms, display_published_ms;
+    int display_placeholder;
     int cap_fd;
     int wake_fd;
     atomic_int interrupted;
@@ -302,6 +303,11 @@ static void ax_publish_display(struct ax_source *src, const uint8_t *frame,
     pthread_mutex_unlock(&src->display_lock);
 }
 
+static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
+                                uint32_t *stride, char *error, uint32_t cap,
+                                uint32_t timeout_ms);
+static void ax_requeue(struct ax_source *src);
+
 static int32_t ax_source_display(void *source,
     const struct onekvm_video_display_request_v1 *request,
     uint8_t *data, uint64_t capacity,
@@ -310,7 +316,7 @@ static int32_t ax_source_display(void *source,
     struct ax_source *src = source;
     struct timespec until;
     uint32_t timeout;
-    int rc = 0;
+    uint64_t deadline;
     if (!src || !request || !result || !data ||
         request->struct_size < sizeof(*request) || result->struct_size < sizeof(*result) ||
         request->width < 0 || request->height < 0 ||
@@ -329,28 +335,77 @@ static int32_t ax_source_display(void *source,
     }
     timeout = request->timeout_ms ? request->timeout_ms : 250;
     if (timeout > 1000) timeout = 1000;
-    clock_gettime(CLOCK_MONOTONIC, &until);
-    until.tv_sec += timeout / 1000;
-    until.tv_nsec += (long)(timeout % 1000) * 1000000L;
-    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
-    pthread_mutex_lock(&src->display_lock);
-    src->display_requested_ms = ax_now_ms();
-    while (src->display_seq == src->display_read_seq && !atomic_load(&src->interrupted) && rc == 0)
-        rc = pthread_cond_timedwait(&src->display_cv, &src->display_lock, &until);
-    if (src->display_seq == src->display_read_seq || atomic_load(&src->interrupted)) {
+    deadline = ax_now_ms() + timeout;
+    for (;;) {
+        uint64_t now = ax_now_ms();
+        const uint8_t *frame = NULL;
+        uint32_t stride = 0;
+        int available;
+
+        pthread_mutex_lock(&src->lock);
+        pthread_mutex_lock(&src->display_lock);
+        src->display_requested_ms = now;
+        available = src->display_placeholder ||
+            (src->display_seq != src->display_read_seq &&
+             now - src->display_published_ms < 200);
         pthread_mutex_unlock(&src->display_lock);
-        ax_err(error, cap, "display timeout");
-        return ONEKVM_VIDEO_RESOURCE_TIMEOUT;
+        /* Display-only demand keeps VIN bound but skips ReadEncodedVideo.
+         * Dequeue here as well, without asking the H.264 encoder for a packet.
+         * The source lock prevents concurrent encoder reads or mode changes. */
+        if (!available && !atomic_load(&src->interrupted) && src->streaming &&
+            now < deadline && (!src->display_published_ms ||
+                               now - src->display_published_ms >= 66)) {
+            uint32_t budget = (uint32_t)(deadline - now);
+            if (budget > 50) budget = 50;
+            if (ax_grab_frame_budget(src, &frame, &stride, error, cap, budget) == 0) {
+                /* A 15 fps panel must not work through a 60 fps FIFO. Drop
+                 * already completed older frames, keeping the newest borrow. */
+                for (unsigned skipped = 1; skipped < src->nbufs; skipped++) {
+                    struct pollfd pending = { .fd = src->cap_fd, .events = POLLIN };
+                    if (poll(&pending, 1, 0) <= 0 || !(pending.revents & POLLIN))
+                        break;
+                    ax_requeue(src);
+                    if (ax_grab_frame_budget(src, &frame, &stride, error, cap, 1) != 0) {
+                        frame = NULL;
+                        break;
+                    }
+                }
+                if (frame) {
+                    ax_publish_display(src, frame, src->map_len[src->held_index],
+                                       stride, src->width, src->height);
+                    ax_requeue(src);
+                    available = 1;
+                }
+            }
+        }
+        pthread_mutex_lock(&src->display_lock);
+        if (available && !atomic_load(&src->interrupted)) {
+            memcpy(data, src->display_rgb, AX_DISPLAY_BYTES);
+            src->display_read_seq = src->display_seq;
+            result->pts_ns = src->display_placeholder ? ax_now_ns() : src->display_pts;
+            pthread_mutex_unlock(&src->display_lock);
+            pthread_mutex_unlock(&src->lock);
+            break;
+        }
+        pthread_mutex_unlock(&src->lock);
+        now = ax_now_ms();
+        if (now >= deadline || atomic_load(&src->interrupted)) {
+            pthread_mutex_unlock(&src->display_lock);
+            ax_err(error, cap, "display timeout");
+            return ONEKVM_VIDEO_RESOURCE_TIMEOUT;
+        }
+        uint64_t wake = now + 15;
+        if (wake > deadline) wake = deadline;
+        until.tv_sec = (time_t)(wake / 1000);
+        until.tv_nsec = (long)(wake % 1000) * 1000000L;
+        pthread_cond_timedwait(&src->display_cv, &src->display_lock, &until);
+        pthread_mutex_unlock(&src->display_lock);
     }
-    memcpy(data, src->display_rgb, AX_DISPLAY_BYTES);
-    src->display_read_seq = src->display_seq;
     result->data_size = AX_DISPLAY_BYTES;
     result->width = AX_DISPLAY_W;
     result->height = AX_DISPLAY_H;
     result->pixel_format = ONEKVM_VIDEO_PIXEL_RGB565;
-    result->pts_ns = src->display_pts;
     result->flags = 0;
-    pthread_mutex_unlock(&src->display_lock);
     return ONEKVM_VIDEO_RESOURCE_OK;
 }
 
@@ -358,6 +413,7 @@ static void ax_release_imports(struct ax_source *src);
 
 static void ax_capture_stop(struct ax_source *src)
 {
+    src->display_placeholder = 0;
     unsigned int i;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
@@ -794,8 +850,9 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     return 0;
 }
 
-static int ax_grab_frame(struct ax_source *src, const uint8_t **data,
-                         uint32_t *stride, char *error, uint32_t error_cap)
+static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
+                                uint32_t *stride, char *error, uint32_t error_cap,
+                                uint32_t timeout_ms)
 {
     struct pollfd pfd[2];
     struct v4l2_buffer buf;
@@ -820,6 +877,8 @@ static int ax_grab_frame(struct ax_source *src, const uint8_t **data,
 
         if (budget < 40)
             budget = 40;
+        if (timeout_ms && budget > timeout_ms)
+            budget = timeout_ms;
         rc = poll(pfd, src->wake_fd >= 0 ? 2 : 1, (int)budget);
     }
     src->capture_ns = ax_now_ns() - t0;
@@ -859,6 +918,12 @@ static int ax_grab_frame(struct ax_source *src, const uint8_t **data,
     *data = src->map[buf.index];
     *stride = src->bytesperline ? src->bytesperline : src->width * 2;
     return 0;
+}
+
+static int ax_grab_frame(struct ax_source *src, const uint8_t **data,
+                         uint32_t *stride, char *error, uint32_t error_cap)
+{
+    return ax_grab_frame_budget(src, data, stride, error, error_cap, 0);
 }
 
 static void ax_requeue(struct ax_source *src)
@@ -1299,6 +1364,14 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
         pthread_mutex_unlock(&src->lock);
         return -1;
     }
+    pthread_mutex_lock(&src->display_lock);
+    src->display_placeholder = ax_display_convert(src->display_rgb,
+        AX_DISPLAY_W, AX_DISPLAY_H, enc->fb_map + enc->geom.off_in,
+        enc->fb.size - enc->geom.off_in, width * 2, width, height) == 0;
+    src->display_pts = ax_now_ns();
+    src->display_seq++;
+    pthread_cond_broadcast(&src->display_cv);
+    pthread_mutex_unlock(&src->display_lock);
     ax_au_ring_alloc(enc);
     enc->bound = src;
     enc->placeholder = 1;
