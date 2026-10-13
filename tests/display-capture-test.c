@@ -60,12 +60,16 @@ int main(void)
     assert(ax_now_ms() - start < 30);
     /* The bound no-signal artwork remains available without encoded packets. */
     src.streaming = 0; src.display_placeholder = 1;
+    src.display_last_read_ms = 0;
     assert(ax_source_display(&src, &request, rgb, AX_DISPLAY_BYTES,
                              &result, error, sizeof(error)) == 0);
     uint64_t pts = result.pts_ns;
+    request.timeout_ms = 250;
+    start = ax_now_ms();
     assert(ax_source_display(&src, &request, rgb, AX_DISPLAY_BYTES,
                              &result, error, sizeof(error)) == 0);
     assert(result.pts_ns > pts && dequeues == 3);
+    assert(ax_now_ms() - start >= 190);
     atomic_store(&src.interrupted, 1);
     assert(ax_source_display(&src, &request, rgb, AX_DISPLAY_BYTES,
                              &result, error, sizeof(error)) == ONEKVM_VIDEO_RESOURCE_TIMEOUT);

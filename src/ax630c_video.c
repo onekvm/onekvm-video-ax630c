@@ -75,6 +75,7 @@ struct ax_source {
     uint8_t display_rgb[AX_DISPLAY_BYTES];
     uint64_t display_seq, display_read_seq, display_pts;
     uint64_t display_requested_ms, display_published_ms;
+    uint64_t display_last_read_ms;
     int display_placeholder;
     int cap_fd;
     int wake_fd;
@@ -345,8 +346,9 @@ static int32_t ax_source_display(void *source,
         pthread_mutex_lock(&src->lock);
         pthread_mutex_lock(&src->display_lock);
         src->display_requested_ms = now;
-        available = src->display_placeholder ||
-            (src->display_seq != src->display_read_seq &&
+        available = (src->display_placeholder &&
+                     (!src->display_last_read_ms || now - src->display_last_read_ms >= 200)) ||
+            (!src->display_placeholder && src->display_seq != src->display_read_seq &&
              now - src->display_published_ms < 200);
         pthread_mutex_unlock(&src->display_lock);
         /* Display-only demand keeps VIN bound but skips ReadEncodedVideo.
@@ -382,6 +384,7 @@ static int32_t ax_source_display(void *source,
         if (available && !atomic_load(&src->interrupted)) {
             memcpy(data, src->display_rgb, AX_DISPLAY_BYTES);
             src->display_read_seq = src->display_seq;
+            src->display_last_read_ms = ax_now_ms();
             result->pts_ns = src->display_placeholder ? ax_now_ns() : src->display_pts;
             pthread_mutex_unlock(&src->display_lock);
             pthread_mutex_unlock(&src->lock);
