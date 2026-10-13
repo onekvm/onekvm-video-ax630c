@@ -1,0 +1,14 @@
+{
+  "id": "ax630c",
+  "api_major": 1,
+  "transport": "native",
+  "driver": "ax630c",
+  "library": "/usr/lib/onekvm/video-backends/ax630c.so",
+  "capabilities": ["video"],
+  "video_codecs": ["auto", "h264"],
+  "video_formats": [
+    {"Width": 1920, "Height": 1080, "FPS": 60, "PixelFormat": "yuyv"},
+    {"Width": 1280, "Height": 720, "FPS": 60, "PixelFormat": "yuyv"},
+    {"Width": 3840, "Height": 2160, "FPS": 30, "PixelFormat": "yuyv"}
+  ]
+}
