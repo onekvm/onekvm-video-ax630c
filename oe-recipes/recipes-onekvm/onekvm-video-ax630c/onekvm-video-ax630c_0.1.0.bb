@@ -19,12 +19,12 @@ do_compile() {
         -I${S}/third_party/vcenc-ewl \
         -I/sources/onekvm-generic-v4l2/include \
         -o ${B}/ax630c.so \
-        ${S}/src/ax630c_video.c ${S}/src/ax_no_signal.c
+        ${S}/src/ax630c_video.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c
     ${CC} ${CFLAGS} ${LDFLAGS} -DAX630C_STANDALONE -pthread \
         -I${S}/third_party/vcenc-ewl \
         -I/sources/onekvm-generic-v4l2/include \
         -o ${B}/ax630c-once \
-        ${S}/src/ax630c_video.c ${S}/src/ax_no_signal.c
+        ${S}/src/ax630c_video.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c
 }
 
 do_install() {
