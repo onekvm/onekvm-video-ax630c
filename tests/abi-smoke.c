@@ -48,9 +48,15 @@ int main(int argc, char **argv)
         !api->encoder_bind_source || !api->encoder_read_packet ||
         !api->encoder_unbind_source)
         return fail("features", "bound encoder ABI missing");
-    if (!(api->codec_mask & ONEKVM_VIDEO_CODEC_MASK_H264) ||
+    if (!(api->codec_mask & ONEKVM_VIDEO_CODEC_MASK_H265) ||
+        !(api->codec_mask & ONEKVM_VIDEO_CODEC_MASK_H264) ||
         !(api->codec_mask & ONEKVM_VIDEO_CODEC_MASK_AUTO))
-        return fail("codecs", "auto and h264 required");
+        return fail("codecs", "auto, h264 and h265 required");
+    if (api->struct_size < offsetof(struct onekvm_video_backend_v1, encoder_color_info) +
+                               sizeof(api->encoder_color_info) ||
+        !(api->features & ONEKVM_VIDEO_FEATURE_ENCODER_COLOR_INFO) ||
+        !api->encoder_color_info)
+        return fail("color info", "optional tail missing");
     memset(&source_config, 0, sizeof(source_config));
     source_config.struct_size = sizeof(source_config);
     source_config.device = "/dev/null";
@@ -60,7 +66,8 @@ int main(int argc, char **argv)
         return fail("source_create", error);
     if (api->source_signal_present && api->source_signal_present(source) != 0)
         return fail("signal", "host smoke must not report a locked HDMI mode");
-    if (!(api->features & ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY) || !api->source_display)
+    if (!(api->features & ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY) ||
+        !(api->features & ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY_CACHE_ONLY) || !api->source_display)
         return fail("display", "RGB565 ABI missing");
     struct onekvm_video_display_request_v1 request = {
         .struct_size = sizeof(request), .width = 640, .height = 360,
@@ -89,11 +96,47 @@ int main(int argc, char **argv)
     encoder_config.fps = 60;
     if (api->encoder_create(&encoder_config, &encoder, error, sizeof(error)) != 0)
         return fail("idle encoder_create", error);
+    struct {
+        struct onekvm_video_color_info_v1 info;
+        uint32_t guard;
+    } color = {{sizeof(color), 99, 99}, 0x1a2b3c4d};
+    if (api->encoder_color_info(encoder, &color.info) != 0 ||
+        color.info.bit_depth != 0 || color.info.color_range != ONEKVM_VIDEO_COLOR_RANGE_UNKNOWN ||
+        color.guard != 0x1a2b3c4d || color.info.struct_size != sizeof(color))
+        return fail("color idle", "must be unknown before first AU; preserve caller tail");
+    color.info.struct_size = sizeof(color.info) - 1;
+    color.info.bit_depth = color.info.color_range = 99;
+    if (api->encoder_color_info(encoder, &color.info) != ONEKVM_VIDEO_RESOURCE_INVALID ||
+        color.info.bit_depth != 99 || color.info.color_range != 99 ||
+        api->encoder_color_info(NULL, &color.info) != ONEKVM_VIDEO_RESOURCE_INVALID ||
+        api->encoder_color_info(encoder, NULL) != ONEKVM_VIDEO_RESOURCE_INVALID)
+        return fail("color size", "invalid output buffer accepted or modified");
     if (api->encoder_unbind_source(encoder, error, sizeof(error)) != 0 ||
         api->encoder_unbind_source(encoder, error, sizeof(error)) != 0)
         return fail("idle encoder_unbind", error);
     if (api->encoder_reset(encoder, &encoder_config, error, sizeof(error)) != 0)
         return fail("idle encoder_reset", error);
+    const uint32_t codecs[] = {ONEKVM_VIDEO_CODEC_H265, ONEKVM_VIDEO_CODEC_H264,
+                              ONEKVM_VIDEO_CODEC_AUTO, ONEKVM_VIDEO_CODEC_H265};
+    for (unsigned i = 0; i < sizeof(codecs) / sizeof(codecs[0]); i++) {
+        encoder_config.codec = codecs[i];
+        if (api->encoder_reset(encoder, &encoder_config, error, sizeof(error)) != 0)
+            return fail("codec reset", error);
+        uint32_t expected = codecs[i] == ONEKVM_VIDEO_CODEC_AUTO
+            ? ONEKVM_VIDEO_CODEC_H264 : codecs[i];
+        if (api->encoder_codec(encoder) != expected)
+            return fail("codec reset", "reported codec differs from configured codec");
+        color.info.struct_size = sizeof(color.info);
+        if (api->encoder_color_info(encoder, &color.info) != 0 ||
+            color.info.bit_depth || color.info.color_range != ONEKVM_VIDEO_COLOR_RANGE_UNKNOWN)
+            return fail("color reset", "stale color information after codec change");
+    }
+    api->encoder_destroy(encoder);
+    encoder = NULL;
+    encoder_config.codec = ONEKVM_VIDEO_CODEC_H265;
+    if (api->encoder_create(&encoder_config, &encoder, error, sizeof(error)) != 0 ||
+        api->encoder_codec(encoder) != ONEKVM_VIDEO_CODEC_H265)
+        return fail("idle HEVC encoder_create", error);
     api->encoder_destroy(encoder);
     api->source_destroy(source);
     dlclose(library);

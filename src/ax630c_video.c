@@ -3,7 +3,7 @@
  * NanoKVM Pro (AX630C) OneKVM video backend.
  *
  * Captures packed YUYV from the open VIN node and submits it to the open
- * VC8000E command engine. The register program and SPS/PPS builders are the
+ * VC8000E command engine. The register program and parameter-set builders are the
  * MIT-or-GPL-2.0 headers under third_party/vcenc-ewl (open-nanokvm-pro
  * vcenc-ewl). This file does not copy the GPL-3 kvm-encoder sources.
  *
@@ -39,8 +39,10 @@
 
 #include "vcenc_encode.h"
 #include "vcenc_header.h"
+#include "vcenc_hevc_header.h"
 #include "ax_no_signal.h"
 #include "ax_display.h"
+#include "ax_tdp.h"
 
 #define AX_DRIVER_ID "ax630c"
 #define AX_CAP_DEV "/dev/video0"
@@ -69,15 +71,26 @@
 struct ax_source {
     char device[256];
     pthread_mutex_t lock;
-    /* Long display waits release VIN; a short dequeue shares its lock. */
+    /* Encoded-session display reads only this cache; display-only capture
+     * takes the VIN lock separately before touching the dequeue queue. */
     pthread_mutex_t display_lock;
     pthread_cond_t display_cv;
     uint8_t display_rgb[AX_DISPLAY_BYTES];
     uint64_t display_seq, display_read_seq, display_pts;
-    uint64_t display_requested_ms, display_published_ms;
+    atomic_uint_fast64_t display_requested_ms, display_published_ms, display_attempted_ms;
     uint64_t display_last_read_ms;
     uint64_t display_stalled_since_ms;
+    uint64_t display_error_ms;
+    struct ax_tdp display_hw;
     int display_placeholder;
+    /* One bounded preview job borrows a capture slot. Only the VIN owner
+     * returns slots; the worker never takes the VIN lock or queues buffers. */
+    pthread_mutex_t display_job_lock;
+    pthread_cond_t display_job_cv;
+    pthread_t display_worker;
+    int display_worker_started, display_worker_stop;
+    int display_job_index, display_job_complete;
+    uint32_t display_job_stride, display_job_width, display_job_height;
     int cap_fd;
     int wake_fd;
     atomic_int interrupted;
@@ -120,6 +133,8 @@ struct ax_encoder {
     uint8_t *fb_map;
     vcenc_geom geom;
     int have_geom;
+    uint32_t codec;
+    atomic_uint color_info;
     uint32_t qp;
     uint32_t gop;
     uint32_t fps;
@@ -287,22 +302,149 @@ static int ax_confirm_new_rx_geometry(struct ax_encoder *enc, struct ax_source *
 
 /* Publish only while a display consumer is active, at most 15 fps. The input
  * remains dequeued until this copy and the encoder have both finished. */
-static void ax_publish_display(struct ax_source *src, const uint8_t *frame,
+static int ax_publish_display(struct ax_source *src, const uint8_t *frame,
                                size_t size, uint32_t stride,
-                               uint32_t width, uint32_t height)
+                               uint32_t width, uint32_t height, int capture_index)
 {
-    uint64_t now = ax_now_ms();
+    int published = 0;
     pthread_mutex_lock(&src->display_lock);
+    uint64_t now = ax_now_ms();
     if (src->display_requested_ms && now - src->display_requested_ms < 2000 &&
-        (!src->display_published_ms || now - src->display_published_ms >= 66) &&
-        ax_display_convert(src->display_rgb, AX_DISPLAY_W, AX_DISPLAY_H,
-                           frame, size, stride, width, height) == 0) {
-        src->display_pts = ax_now_ns();
-        src->display_published_ms = now;
-        src->display_seq++;
-        pthread_cond_broadcast(&src->display_cv);
+        (!src->display_attempted_ms || now - src->display_attempted_ms >= 66)) {
+        src->display_attempted_ms = now;
+        int rc;
+        if (capture_index >= 0) {
+            struct v4l2_exportbuffer exp = {
+                .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                .index = (unsigned)capture_index, .flags = O_CLOEXEC,
+            };
+            if (ioctl(src->cap_fd, VIDIOC_EXPBUF, &exp) < 0) {
+                rc = -errno;
+            } else {
+                rc = ax_tdp_convert(&src->display_hw, src->display_rgb,
+                                    AX_DISPLAY_W, AX_DISPLAY_H, exp.fd,
+                                    stride, width, height);
+                close(exp.fd);
+            }
+            if (rc && (!src->display_error_ms || now - src->display_error_ms >= 5000)) {
+                fprintf(stderr, "ax630c: TDP preview: %s\n", strerror(-rc));
+                src->display_error_ms = now;
+            }
+        } else {
+            /* Static no-signal artwork has no VIN DMA-BUF. */
+            rc = ax_display_convert(src->display_rgb, AX_DISPLAY_W, AX_DISPLAY_H,
+                                    frame, size, stride, width, height);
+        }
+        if (rc == 0) {
+            src->display_pts = ax_now_ns();
+            src->display_published_ms = now;
+            src->display_seq++;
+            published = 1;
+            pthread_cond_broadcast(&src->display_cv);
+        }
     }
     pthread_mutex_unlock(&src->display_lock);
+    return published;
+}
+
+static void ax_queue_capture_index(struct ax_source *src, uint32_t index)
+{
+    struct v4l2_buffer buf = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+        .index = index,
+    };
+    if (ioctl(src->cap_fd, VIDIOC_QBUF, &buf) < 0)
+        fprintf(stderr, "ax630c: QBUF %u: %s\n", index, strerror(errno));
+}
+
+static void *ax_display_worker(void *arg)
+{
+    struct ax_source *src = arg;
+    pthread_setname_np(pthread_self(), "ax-rgb-preview");
+    pthread_mutex_lock(&src->display_job_lock);
+    for (;;) {
+        while (!src->display_worker_stop &&
+               (src->display_job_index < 0 || src->display_job_complete))
+            pthread_cond_wait(&src->display_job_cv, &src->display_job_lock);
+        if (src->display_worker_stop)
+            break;
+        unsigned index = (unsigned)src->display_job_index;
+        const uint8_t *frame = src->map[index];
+        size_t size = src->map_len[index];
+        uint32_t stride = src->display_job_stride;
+        uint32_t width = src->display_job_width, height = src->display_job_height;
+        pthread_mutex_unlock(&src->display_job_lock);
+        ax_publish_display(src, frame, size, stride, width, height, (int)index);
+        pthread_mutex_lock(&src->display_job_lock);
+        src->display_job_complete = 1;
+        pthread_cond_broadcast(&src->display_job_cv);
+    }
+    pthread_mutex_unlock(&src->display_job_lock);
+    return NULL;
+}
+
+static int ax_start_display_worker(struct ax_source *src)
+{
+    int rc = pthread_create(&src->display_worker, NULL, ax_display_worker, src);
+    if (!rc)
+        src->display_worker_started = 1;
+    return rc;
+}
+
+/* Call with VIN locked. Completion never needs VIN, so teardown can wait
+ * without exposing half-reconfigured capture state to the encoder. */
+static void ax_collect_display_job(struct ax_source *src, int wait, int requeue)
+{
+    pthread_mutex_lock(&src->display_job_lock);
+    while (wait && src->display_job_index >= 0 && !src->display_job_complete)
+        pthread_cond_wait(&src->display_job_cv, &src->display_job_lock);
+    if (src->display_job_index >= 0 && src->display_job_complete) {
+        uint32_t index = (uint32_t)src->display_job_index;
+        src->display_job_index = -1;
+        src->display_job_complete = 0;
+        if (requeue && src->streaming && src->cap_fd >= 0 &&
+            (!src->held || src->held_index != index))
+            ax_queue_capture_index(src, index);
+    }
+    pthread_mutex_unlock(&src->display_job_lock);
+}
+
+/* Only the encoded producer submits jobs, while holding VIN. Never wait
+ * for conversion or the RGB cache lock on the primary encoding thread. */
+static void ax_schedule_display(struct ax_source *src, uint32_t stride)
+{
+    uint64_t requested = atomic_load(&src->display_requested_ms);
+    uint64_t attempted = atomic_load(&src->display_attempted_ms);
+    uint64_t now = ax_now_ms();
+    if (!src->display_worker_started || !src->held || src->nbufs < 3 ||
+        atomic_load(&src->interrupted) || !requested || now - requested >= 2000 ||
+        (attempted && now - attempted < 66))
+        return;
+    ax_collect_display_job(src, 0, 1);
+    pthread_mutex_lock(&src->display_job_lock);
+    if (src->display_job_index < 0) {
+        src->display_job_index = (int)src->held_index;
+        src->display_job_complete = 0;
+        src->display_job_stride = stride;
+        src->display_job_width = src->width;
+        src->display_job_height = src->height;
+        pthread_cond_signal(&src->display_job_cv);
+    }
+    pthread_mutex_unlock(&src->display_job_lock);
+}
+
+/* Drain the job before stopping or unmapping capture. */
+static void ax_stop_display_worker(struct ax_source *src)
+{
+    if (!src->display_worker_started)
+        return;
+    pthread_mutex_lock(&src->display_job_lock);
+    src->display_worker_stop = 1;
+    pthread_cond_signal(&src->display_job_cv);
+    pthread_mutex_unlock(&src->display_job_lock);
+    pthread_join(src->display_worker, NULL);
+    src->display_worker_started = 0;
 }
 
 static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
@@ -322,6 +464,7 @@ static int32_t ax_source_display(void *source,
     struct timespec until;
     uint32_t timeout;
     uint64_t deadline;
+    int cache_only;
     if (!src || !request || !result || !data ||
         request->struct_size < sizeof(*request) || result->struct_size < sizeof(*result) ||
         request->width < 0 || request->height < 0 ||
@@ -330,7 +473,8 @@ static int32_t ax_source_display(void *source,
         ax_err(error, cap, "invalid display request");
         return ONEKVM_VIDEO_RESOURCE_INVALID;
     }
-    if (request->flags || (request->pixel_format && request->pixel_format != ONEKVM_VIDEO_PIXEL_RGB565)) {
+    if ((request->flags & ~ONEKVM_VIDEO_DISPLAY_REQUEST_CACHE_ONLY) ||
+        (request->pixel_format && request->pixel_format != ONEKVM_VIDEO_PIXEL_RGB565)) {
         ax_err(error, cap, "unsupported display format");
         return ONEKVM_VIDEO_RESOURCE_UNSUPPORTED;
     }
@@ -338,6 +482,7 @@ static int32_t ax_source_display(void *source,
         ax_err(error, cap, "display buffer is too small");
         return ONEKVM_VIDEO_RESOURCE_BUFFER_TOO_SMALL;
     }
+    cache_only = (request->flags & ONEKVM_VIDEO_DISPLAY_REQUEST_CACHE_ONLY) != 0;
     timeout = request->timeout_ms ? request->timeout_ms : 250;
     if (timeout > 1000) timeout = 1000;
     deadline = ax_now_ms() + timeout;
@@ -347,18 +492,21 @@ static int32_t ax_source_display(void *source,
         uint32_t stride = 0;
         int available;
 
-        pthread_mutex_lock(&src->lock);
+        if (!cache_only)
+            pthread_mutex_lock(&src->lock);
         pthread_mutex_lock(&src->display_lock);
+        now = ax_now_ms();
         src->display_requested_ms = now;
         available = (src->display_placeholder &&
                      (!src->display_last_read_ms || now - src->display_last_read_ms >= 200)) ||
             (!src->display_placeholder && src->display_seq != src->display_read_seq &&
              now - src->display_published_ms < 200);
         pthread_mutex_unlock(&src->display_lock);
-        /* Display-only demand keeps VIN bound but skips ReadEncodedVideo.
-         * Dequeue here as well, without asking the H.264 encoder for a packet.
-         * The source lock prevents concurrent encoder reads or mode changes. */
-        if (!available && !atomic_load(&src->interrupted) && src->streaming &&
+        /* Only display-only demand may dequeue VIN. With an encoded session,
+         * wait for the RGB copy published by its producer instead of draining
+         * frames or performing stall recovery under the primary stream. */
+        if (!available && !cache_only &&
+            !atomic_load(&src->interrupted) && src->streaming &&
             now < deadline && (!src->display_published_ms ||
                                now - src->display_published_ms >= 66)) {
             uint32_t budget = (uint32_t)(deadline - now);
@@ -378,10 +526,9 @@ static int32_t ax_source_display(void *source,
                     }
                 }
                 if (frame) {
-                    ax_publish_display(src, frame, src->map_len[src->held_index],
-                                       stride, src->width, src->height);
+                    available = ax_publish_display(src, frame, src->map_len[src->held_index],
+                                       stride, src->width, src->height, (int)src->held_index);
                     ax_requeue(src);
-                    available = 1;
                 }
             } else if (captured == 2) {
                 uint32_t w, h, fps;
@@ -403,16 +550,19 @@ static int32_t ax_source_display(void *source,
         }
         pthread_mutex_lock(&src->display_lock);
         if (available && !atomic_load(&src->interrupted)) {
-            src->display_stalled_since_ms = 0;
+            if (!cache_only)
+                src->display_stalled_since_ms = 0;
             memcpy(data, src->display_rgb, AX_DISPLAY_BYTES);
             src->display_read_seq = src->display_seq;
             src->display_last_read_ms = ax_now_ms();
             result->pts_ns = src->display_placeholder ? ax_now_ns() : src->display_pts;
             pthread_mutex_unlock(&src->display_lock);
-            pthread_mutex_unlock(&src->lock);
+            if (!cache_only)
+                pthread_mutex_unlock(&src->lock);
             break;
         }
-        pthread_mutex_unlock(&src->lock);
+        if (!cache_only)
+            pthread_mutex_unlock(&src->lock);
         now = ax_now_ms();
         if (now >= deadline || atomic_load(&src->interrupted)) {
             pthread_mutex_unlock(&src->display_lock);
@@ -438,7 +588,10 @@ static void ax_release_imports(struct ax_source *src);
 
 static void ax_capture_stop(struct ax_source *src)
 {
+    ax_collect_display_job(src, 1, 0);
+    pthread_mutex_lock(&src->display_lock);
     src->display_placeholder = 0;
+    pthread_mutex_unlock(&src->display_lock);
     src->display_stalled_since_ms = 0;
     unsigned int i;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -569,6 +722,7 @@ static void *ax_map_pool(int fd, uint64_t phys, uint32_t size)
 
 static void ax_encoder_release_framebuf(struct ax_encoder *enc)
 {
+    atomic_store(&enc->color_info, 0);
     if (enc->fb_map && enc->fb_map != MAP_FAILED)
         munmap(enc->fb_map, enc->fb.size ? enc->fb.size : enc->geom.span);
     enc->fb_map = NULL;
@@ -730,6 +884,17 @@ static int ax_au_acquire(struct ax_encoder *enc)
     return -1;
 }
 
+static uint32_t ax_write_parameter_sets(struct ax_encoder *enc, uint8_t *out)
+{
+    uint32_t size;
+
+    if (enc->codec == ONEKVM_VIDEO_CODEC_H265)
+        return vcenc_write_hevc_headers(out, enc->geom.w, enc->geom.h, enc->qp,
+                                       vcenc_hevc_level_idc(enc->geom.w, enc->geom.h));
+    size = vcenc_write_sps(out, enc->geom.w, enc->geom.h);
+    return size + vcenc_write_pps(out + size, enc->qp);
+}
+
 static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
                           uint32_t src_stride, uint32_t input_phys,
                           int is_idr, uint32_t gopn)
@@ -745,6 +910,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     uint64_t t0;
     int nut;
     int au_slot;
+    int hevc = enc->codec == ONEKVM_VIDEO_CODEC_H265;
 
     if (enc->dma_slot >= 0) {
         atomic_store(&enc->au[enc->dma_slot].busy, 0);
@@ -770,8 +936,9 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     memset(&fr, 0, sizeof(fr));
     fr.frame_num = gopn;
     fr.qp = enc->qp;
-    fr.codec = ENC_CODEC_H264;
-    fr.rc_mode = ENC_RC_LEGACY;
+    fr.codec = hevc ? ENC_CODEC_HEVC : ENC_CODEC_H264;
+    /* The HEVC PPS and hardware use the matching fixed-QP program. */
+    fr.rc_mode = hevc ? ENC_RC_FIXQP : ENC_RC_LEGACY;
     fr.input_phys = input_phys;
     au_slot = ax_au_acquire(enc);
     if (au_slot >= 0)
@@ -803,7 +970,9 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
             atomic_store(&enc->au[au_slot].busy, 0);
         return -1;
     }
-    enc->encode_ns = ax_now_ns() - t0;
+    /* Preserve this AU's observed hardware completion through publication. */
+    enc->packet_pts = ax_now_ns();
+    enc->encode_ns = enc->packet_pts - t0;
 
     regs = (volatile uint32_t *)(enc->status + STATUS_SLOT_REG_OFF(id, 0));
     swreg9 = regs[9];
@@ -812,13 +981,15 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
         slice = (volatile uint8_t *)(enc->au[au_slot].map + AX_AU_HEADROOM);
     else
         slice = (volatile uint8_t *)(enc->fb_map + enc->geom.off_out + ENC_STREAM_SUBOFF);
-    nut = (swreg9 > 4) ? (slice[4] & 0x1f) : -1;
+    nut = swreg9 > (hevc ? 5u : 4u)
+        ? (hevc ? (slice[4] >> 1) & 0x3f : slice[4] & 0x1f) : -1;
     {
         uint16_t rid = id;
         ioctl(enc->venc_fd, HANTRO_IOCH_RELEASE_CMDBUF, &rid);
     }
     if (wid != CMDBUF_EXE_STATUS_OK || swreg82 == 0 || swreg9 < 5 ||
-        swreg9 > enc->geom.out_limit || (is_idr ? nut != 5 : nut != 1)) {
+        swreg9 > enc->geom.out_limit ||
+        (is_idr ? nut != (hevc ? 19 : 5) : nut != 1)) {
         fprintf(stderr,
                 "ax630c: encode reject idr=%d wait=%u bytes=%u cycles=%u nal=%d\n",
                 is_idr, wid, swreg9, swreg82, nut);
@@ -833,8 +1004,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
         if (is_idr) {
             uint8_t hdr[AX_AU_HEADROOM];
 
-            hlen = vcenc_write_sps(hdr, enc->geom.w, enc->geom.h);
-            hlen += vcenc_write_pps(hdr + hlen, enc->qp);
+            hlen = ax_write_parameter_sets(enc, hdr);
             if (hlen > AX_AU_HEADROOM) {
                 atomic_store(&enc->au[au_slot].busy, 0);
                 return -1;
@@ -854,8 +1024,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
             enc->packet_cap = (size_t)swreg9 + 256;
         }
         if (is_idr) {
-            hlen = vcenc_write_sps(enc->packet, enc->geom.w, enc->geom.h);
-            hlen += vcenc_write_pps(enc->packet + hlen, enc->qp);
+            hlen = ax_write_parameter_sets(enc, enc->packet);
         }
         memcpy(enc->packet + hlen, (const void *)slice, swreg9);
         enc->publish = enc->packet;
@@ -863,10 +1032,17 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
         enc->dma_slot = -1;
     }
     enc->packet_key = is_idr ? 1u : 0u;
+    if (is_idr) {
+        /* Published only after a successful AU with our actual SPS/VUI.
+         * This describes the encoded stream, never the HDMI input depth. */
+        uint32_t range = VCENC_VIDEO_FULL_RANGE
+            ? ONEKVM_VIDEO_COLOR_RANGE_FULL : ONEKVM_VIDEO_COLOR_RANGE_LIMITED;
+        atomic_store(&enc->color_info, VCENC_COMPONENT_BITS | (range << 8));
+    }
     if (enc->logged < 8 || (enc->seq % 120u) == 0) {
         fprintf(stderr,
-                "ax630c: frame %u %s %ux%u bytes=%zu cycles=%u head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                enc->seq, is_idr ? "IDR" : "P", enc->geom.w, enc->geom.h,
+                "ax630c: frame %u %s %s %ux%u bytes=%zu cycles=%u head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                enc->seq, hevc ? "H.265" : "H.264", is_idr ? "IDR" : "P", enc->geom.w, enc->geom.h,
                 enc->packet_len, swreg82,
                 enc->publish[0], enc->publish[1], enc->publish[2], enc->publish[3],
                 enc->publish[4], enc->publish[5], enc->publish[6],
@@ -885,6 +1061,7 @@ static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
     int rc;
     uint64_t t0;
 
+    ax_collect_display_job(src, 0, 1);
     if (atomic_load(&src->interrupted)) {
         ax_err(error, error_cap, "capture interrupted");
         return -1;
@@ -954,16 +1131,11 @@ static int ax_grab_frame(struct ax_source *src, const uint8_t **data,
 
 static void ax_requeue(struct ax_source *src)
 {
-    struct v4l2_buffer buf;
-
+    ax_collect_display_job(src, 0, 1);
     if (!src->held || src->cap_fd < 0)
         return;
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = src->held_index;
-    if (ioctl(src->cap_fd, VIDIOC_QBUF, &buf) < 0)
-        fprintf(stderr, "ax630c: QBUF %u: %s\n", src->held_index, strerror(errno));
+    if ((int)src->held_index != src->display_job_index)
+        ax_queue_capture_index(src, src->held_index);
     src->held = 0;
 }
 
@@ -1043,14 +1215,21 @@ static void ax_source_init(struct ax_source *src)
     src->cap_fd = -1;
     src->wake_fd = -1;
     src->import_venc_fd = -1;
+    ax_tdp_init(&src->display_hw);
     pthread_mutex_init(&src->lock, NULL);
     pthread_mutex_init(&src->display_lock, NULL);
+    pthread_mutex_init(&src->display_job_lock, NULL);
+    pthread_cond_init(&src->display_job_cv, NULL);
+    src->display_job_index = -1;
     pthread_condattr_t attr;
     pthread_condattr_init(&attr);
     pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
     pthread_cond_init(&src->display_cv, &attr);
     pthread_condattr_destroy(&attr);
     atomic_init(&src->interrupted, 0);
+    atomic_init(&src->display_requested_ms, 0);
+    atomic_init(&src->display_published_ms, 0);
+    atomic_init(&src->display_attempted_ms, 0);
 }
 
 static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *config,
@@ -1073,14 +1252,26 @@ static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *conf
     src->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (src->wake_fd < 0) {
         ax_err_errno(error, error_cap, "eventfd");
-        pthread_cond_destroy(&src->display_cv);
-        pthread_mutex_destroy(&src->display_lock);
-        pthread_mutex_destroy(&src->lock);
-        free(src);
-        return -1;
+        goto fail;
+    }
+    int rc = ax_start_display_worker(src);
+    if (rc) {
+        errno = rc;
+        ax_err_errno(error, error_cap, "display worker");
+        goto fail;
     }
     *source = src;
     return 0;
+fail:
+    if (src->wake_fd >= 0)
+        close(src->wake_fd);
+    pthread_cond_destroy(&src->display_job_cv);
+    pthread_mutex_destroy(&src->display_job_lock);
+    pthread_cond_destroy(&src->display_cv);
+    pthread_mutex_destroy(&src->display_lock);
+    pthread_mutex_destroy(&src->lock);
+    free(src);
+    return -1;
 }
 
 static int32_t ax_source_reset(void *source,
@@ -1148,10 +1339,14 @@ static void ax_source_destroy(void *source)
         return;
     pthread_mutex_lock(&src->lock);
     ax_capture_stop(src);
+    ax_stop_display_worker(src);
     pthread_mutex_unlock(&src->lock);
     if (src->wake_fd >= 0)
         close(src->wake_fd);
+    ax_tdp_close(&src->display_hw);
     pthread_cond_destroy(&src->display_cv);
+    pthread_cond_destroy(&src->display_job_cv);
+    pthread_mutex_destroy(&src->display_job_lock);
     pthread_mutex_destroy(&src->display_lock);
     pthread_mutex_destroy(&src->lock);
     free(src);
@@ -1258,8 +1453,9 @@ static int32_t ax_encoder_create(const struct onekvm_video_encoder_config_v1 *co
         return -1;
     }
     if (config->codec != ONEKVM_VIDEO_CODEC_AUTO &&
-        config->codec != ONEKVM_VIDEO_CODEC_H264) {
-        ax_err(error, error_cap, "ax630c backend encodes H.264");
+        config->codec != ONEKVM_VIDEO_CODEC_H264 &&
+        config->codec != ONEKVM_VIDEO_CODEC_H265) {
+        ax_err(error, error_cap, "ax630c backend encodes H.264 and H.265");
         return -1;
     }
     enc = calloc(1, sizeof(*enc));
@@ -1269,6 +1465,9 @@ static int32_t ax_encoder_create(const struct onekvm_video_encoder_config_v1 *co
     }
     enc->venc_fd = -1;
     enc->dma_slot = -1;
+    atomic_init(&enc->color_info, 0);
+    enc->codec = config->codec == ONEKVM_VIDEO_CODEC_H265
+        ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
     enc->qp = ENC_QP_FIXED;
     enc->gop = 30;
     enc->fps = 60;
@@ -1295,8 +1494,9 @@ static int32_t ax_encoder_reset(void *encoder,
         return -1;
     }
     if (config->codec != ONEKVM_VIDEO_CODEC_AUTO &&
-        config->codec != ONEKVM_VIDEO_CODEC_H264) {
-        ax_err(error, error_cap, "ax630c backend encodes H.264");
+        config->codec != ONEKVM_VIDEO_CODEC_H264 &&
+        config->codec != ONEKVM_VIDEO_CODEC_H265) {
+        ax_err(error, error_cap, "ax630c backend encodes H.264 and H.265");
         return -1;
     }
     if (config->gop > 1)
@@ -1305,7 +1505,10 @@ static int32_t ax_encoder_reset(void *encoder,
         enc->fps = (uint32_t)config->fps;
     if (config->initial_qp >= 16 && config->initial_qp <= 51)
         enc->qp = (uint32_t)config->initial_qp;
+    enc->codec = config->codec == ONEKVM_VIDEO_CODEC_H265
+        ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
     enc->force_idr = 1;
+    atomic_store(&enc->color_info, 0);
     return 0;
 }
 
@@ -1344,8 +1547,9 @@ static int32_t ax_encoder_request_keyframe(void *encoder, char *error, uint32_t 
 
 static uint32_t ax_encoder_codec(void *encoder)
 {
-    (void)encoder;
-    return ONEKVM_VIDEO_CODEC_H264;
+    const struct ax_encoder *enc = encoder;
+
+    return enc ? enc->codec : ONEKVM_VIDEO_CODEC_H264;
 }
 
 static void ax_encoder_destroy(void *encoder)
@@ -1582,7 +1786,7 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         is_idr = gopn == 0;
         ax_publish_display(src, enc->fb_map + enc->geom.off_in,
                            (size_t)enc->geom.w * enc->geom.h * 2u,
-                           enc->geom.w * 2u, enc->geom.w, enc->geom.h);
+                           enc->geom.w * 2u, enc->geom.w, enc->geom.h, -1);
         rc = ax_encode_yuyv(enc, NULL, 0,
                             (uint32_t)enc->fb.bus_addr + enc->geom.off_in,
                             is_idr, gopn);
@@ -1642,8 +1846,7 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         pthread_mutex_unlock(&src->lock);
         return -1;
     }
-    ax_publish_display(src, frame, src->map_len[src->held_index],
-                       stride, src->width, src->height);
+    ax_schedule_display(src, stride);
     if (enc->early_capture) {
         enc->early_frame_seen = 1;
         enc->signal_loss_since_ms = 0;
@@ -1713,11 +1916,10 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         return -1;
     }
 encoded:
-    enc->packet_pts = enc->fps ? (uint64_t)enc->seq * 1000000000ull / enc->fps : 0;
     enc->seq++;
     packet->data = enc->publish ? enc->publish : enc->packet;
     packet->data_size = enc->packet_len;
-    packet->codec = ONEKVM_VIDEO_CODEC_H264;
+    packet->codec = enc->codec;
     packet->key_frame = enc->packet_key;
     packet->pts_ns = enc->packet_pts;
     return 0;
@@ -1762,6 +1964,18 @@ static int32_t ax_encoder_latency(void *encoder, struct onekvm_video_latency_v1 
     return 0;
 }
 
+static int32_t ax_encoder_color_info(void *encoder,
+                                    struct onekvm_video_color_info_v1 *info)
+{
+    struct ax_encoder *enc = encoder;
+    if (!enc || !info || info->struct_size < sizeof(*info))
+        return ONEKVM_VIDEO_RESOURCE_INVALID;
+    uint32_t cached = atomic_load(&enc->color_info);
+    info->bit_depth = cached & 0xffu;
+    info->color_range = cached >> 8;
+    return ONEKVM_VIDEO_RESOURCE_OK;
+}
+
 static const struct onekvm_video_format_v1 ax_formats[] = {
     {sizeof(struct onekvm_video_format_v1), 1920, 1080, 60, ONEKVM_VIDEO_PIXEL_UNKNOWN, 0},
     {sizeof(struct onekvm_video_format_v1), 1280, 720, 60, ONEKVM_VIDEO_PIXEL_UNKNOWN, 0},
@@ -1772,14 +1986,18 @@ static const struct onekvm_video_backend_v1 ax_backend = {
     .struct_size = sizeof(struct onekvm_video_backend_v1),
     .abi_version = ONEKVM_VIDEO_BACKEND_ABI_V1,
     .driver_id = AX_DRIVER_ID,
-    .codec_mask = ONEKVM_VIDEO_CODEC_MASK_AUTO | ONEKVM_VIDEO_CODEC_MASK_H264,
+    .codec_mask = ONEKVM_VIDEO_CODEC_MASK_AUTO | ONEKVM_VIDEO_CODEC_MASK_H264 |
+                  ONEKVM_VIDEO_CODEC_MASK_H265,
     .features = ONEKVM_VIDEO_FEATURE_SIGNAL_PRESENT |
                 ONEKVM_VIDEO_FEATURE_INTERRUPT_READ |
                 ONEKVM_VIDEO_FEATURE_KEYFRAME |
                 ONEKVM_VIDEO_FEATURE_BORROWED_PACKET |
                 ONEKVM_VIDEO_FEATURE_BOUND_ENCODER |
                 ONEKVM_VIDEO_FEATURE_LATENCY |
-                ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY,
+                ONEKVM_VIDEO_FEATURE_BOUND_ENCODED_TIME |
+                ONEKVM_VIDEO_FEATURE_ENCODER_COLOR_INFO |
+                ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY |
+                ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY_CACHE_ONLY,
     .formats = ax_formats,
     .format_count = (uint32_t)(sizeof(ax_formats) / sizeof(ax_formats[0])),
     .source_create = ax_source_create,
@@ -1805,6 +2023,7 @@ static const struct onekvm_video_backend_v1 ax_backend = {
     .source_latency = ax_source_latency,
     .source_display = ax_source_display,
     .encoder_latency = ax_encoder_latency,
+    .encoder_color_info = ax_encoder_color_info,
 };
 
 ONEKVM_VIDEO_EXPORT int32_t onekvm_video_backend_query(uint32_t requested_abi,
@@ -1834,12 +2053,18 @@ int main(int argc, char **argv)
     int got = 0;
     int spins = 0;
 
+    if (argc > 3 && strcmp(argv[3], "h264") && strcmp(argv[3], "h265")) {
+        fprintf(stderr, "usage: %s output frames [h264|h265]\n", argv[0]);
+        return 1;
+    }
+
     memset(&sc, 0, sizeof(sc));
     sc.struct_size = sizeof(sc);
     sc.device = AX_CAP_DEV;
     memset(&ec, 0, sizeof(ec));
     ec.struct_size = sizeof(ec);
-    ec.codec = ONEKVM_VIDEO_CODEC_H264;
+    ec.codec = argc > 3 && strcmp(argv[3], "h265") == 0
+        ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
     ec.gop = 30;
     ec.fps = 60;
     if (ax_encoder_create(&ec, &encoder, error, sizeof(error)) != 0) {
@@ -1880,7 +2105,13 @@ int main(int argc, char **argv)
     }
     fclose(out);
     fprintf(stderr, "ax630c: wrote %d frames to %s\n", got, path);
+    struct onekvm_video_color_info_v1 color = {.struct_size = sizeof(color)};
+    if (ax_encoder_color_info(encoder, &color) != 0)
+        return 1;
+    fprintf(stderr, "ax630c: encoded color depth=%u range=%u\n", color.bit_depth, color.color_range);
     ax_encoder_unbind_source(encoder, error, sizeof(error));
+    if (ax_encoder_color_info(encoder, &color) != 0 || color.bit_depth || color.color_range)
+        return 1;
     ax_source_destroy(source);
     ax_encoder_destroy(encoder);
     return got > 0 ? 0 : 2;

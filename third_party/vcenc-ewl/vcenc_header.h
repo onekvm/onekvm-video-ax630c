@@ -20,6 +20,11 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Shared with the color-info ABI. Both hardware programs use 8-bit Main
+ * profiles; both emitted VUIs describe limited-range BT.709 output. */
+#define VCENC_COMPONENT_BITS 8u
+#define VCENC_VIDEO_FULL_RANGE 0u
+
 struct bitw {
 	uint8_t buf[128];
 	uint32_t bitpos;
@@ -115,7 +120,15 @@ static uint32_t vcenc_write_sps(uint8_t *out, uint32_t width, uint32_t height)
 	bw_u(&w, 1, 1);         /* vui_parameters_present_flag */
 	bw_u(&w, 0, 1);         /* aspect_ratio_info_present_flag */
 	bw_u(&w, 0, 1);         /* overscan_info_present_flag */
-	bw_u(&w, 0, 1);         /* video_signal_type_present_flag */
+	/* The HDMI bridge supplies limited-range BT.709 YUYV. Signal it for
+	 * every output size; decoder defaults can otherwise use BT.601. */
+	bw_u(&w, 1, 1);         /* video_signal_type_present_flag */
+	bw_u(&w, 5, 3);         /* video_format: unspecified */
+	bw_u(&w, VCENC_VIDEO_FULL_RANGE, 1); /* video_full_range_flag */
+	bw_u(&w, 1, 1);         /* colour_description_present_flag */
+	bw_u(&w, 1, 8);         /* colour_primaries: BT.709 */
+	bw_u(&w, 1, 8);         /* transfer_characteristics: BT.709 */
+	bw_u(&w, 1, 8);         /* matrix_coefficients: BT.709 */
 	bw_u(&w, 0, 1);         /* chroma_loc_info_present_flag */
 	bw_u(&w, 0, 1);         /* timing_info_present_flag */
 	bw_u(&w, 0, 1);         /* nal_hrd_parameters_present_flag */
