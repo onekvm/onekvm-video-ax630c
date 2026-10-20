@@ -1,0 +1,12 @@
+[Unit]
+Description=OneKVM hardware video decoder
+After=systemd-modules-load.service
+Before=onekvm.service onekvm-device-screen-display.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/onekvm/activate-vdec
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+# Shared scaler/CSC alias: VIN and VDEC use this standard V4L2 mem2mem device.
+modprobe ax630c_tdp
+for node in /sys/bus/platform/devices/4405000.image-processor/video4linux/video*; do
+    test -d "$node" || continue
+    target="/dev/${node##*/}"
+    test -c "$target"
+    chmod 0600 "$target"
+    ln -sfn "$target" /dev/onekvm-vproc
+done
+test -c /dev/onekvm-vproc
+test -c /dev/onekvm-vdec && test -c /dev/onekvm-vdec-media && exit 0
+device=/sys/bus/platform/devices/4020000.vdec
+test -d "$device" || exit 0
+modprobe hantro-vpu
+# Older running kernels bind this resource to a register-only diagnostic
+# driver. Migrate only that device; newer DTs bind the VDEC module directly.
+driver=$(readlink "$device/driver" || true)
+if [ "${driver##*/}" = axera-vpu ]; then
+    printf '%s\n' hantro-vpu > "$device/driver_override"
+    printf '%s\n' 4020000.vdec > "$device/driver/unbind"
+fi
+if ! test -d "$device/video4linux"; then
+    printf '%s\n' 4020000.vdec > /sys/bus/platform/drivers_probe
+fi
+if ! test -d "$device/video4linux"; then
+    printf '\n' > "$device/driver_override"
+    printf '%s\n' 4020000.vdec > /sys/bus/platform/drivers_probe || true
+    echo 'OneKVM V4L2 decoder did not register' >&2
+    exit 1
+fi
+# Coldplug-only udev images do not keep a daemon alive. The rules handle
+# normal hotplug; also establish aliases directly after this explicit bind.
+for node in "$device"/video4linux/video*; do
+    test -d "$node" || continue
+    target="/dev/${node##*/}"
+    test -c "$target"
+    chmod 0600 "$target"
+    ln -sfn "$target" /dev/onekvm-vdec
+done
+for node in "$device"/media*; do
+    test -d "$node" || continue
+    target="/dev/${node##*/}"
+    test -c "$target"
+    chmod 0600 "$target"
+    ln -sfn "$target" /dev/onekvm-vdec-media
+done
+test -c /dev/onekvm-vdec && test -c /dev/onekvm-vdec-media

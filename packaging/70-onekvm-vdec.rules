@@ -1,0 +1,4 @@
+# Stable names for the standard V4L2 mem2mem decoder and its Media Request API.
+SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", DRIVERS=="hantro-vpu", ATTR{name}=="axera,*-dec", SYMLINK+="onekvm-vdec", MODE="0600"
+SUBSYSTEM=="media", DRIVERS=="hantro-vpu", SYMLINK+="onekvm-vdec-media", MODE="0600"
+SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", DRIVERS=="ax630c-tdp", ATTR{name}=="ax630c-tdp", SYMLINK+="onekvm-vproc", MODE="0600"
