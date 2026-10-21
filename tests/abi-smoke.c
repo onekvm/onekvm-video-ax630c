@@ -48,6 +48,9 @@ int main(int argc, char **argv)
         !api->encoder_bind_source || !api->encoder_read_packet ||
         !api->encoder_unbind_source)
         return fail("features", "bound encoder ABI missing");
+    if (!(api->features & ONEKVM_VIDEO_FEATURE_EDID) ||
+        !api->edid_capabilities || !api->edid_get || !api->edid_set)
+        return fail("EDID", "library-level EDID ABI missing");
     if (!(api->codec_mask & ONEKVM_VIDEO_CODEC_MASK_H265) ||
         !(api->codec_mask & ONEKVM_VIDEO_CODEC_MASK_H264) ||
         !(api->codec_mask & ONEKVM_VIDEO_CODEC_MASK_AUTO))

@@ -43,6 +43,7 @@
 #include "ax_no_signal.h"
 #include "ax_display.h"
 #include "ax_tdp.h"
+#include "ax_edid.h"
 
 #define AX_DRIVER_ID "ax630c"
 #define AX_CAP_DEV "/dev/video0"
@@ -1994,6 +1995,7 @@ static const struct onekvm_video_backend_v1 ax_backend = {
                 ONEKVM_VIDEO_FEATURE_BORROWED_PACKET |
                 ONEKVM_VIDEO_FEATURE_BOUND_ENCODER |
                 ONEKVM_VIDEO_FEATURE_LATENCY |
+                ONEKVM_VIDEO_FEATURE_EDID |
                 ONEKVM_VIDEO_FEATURE_BOUND_ENCODED_TIME |
                 ONEKVM_VIDEO_FEATURE_ENCODER_COLOR_INFO |
                 ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY |
@@ -2023,6 +2025,9 @@ static const struct onekvm_video_backend_v1 ax_backend = {
     .source_latency = ax_source_latency,
     .source_display = ax_source_display,
     .encoder_latency = ax_encoder_latency,
+    .edid_capabilities = ax_edid_capabilities,
+    .edid_get = ax_edid_get,
+    .edid_set = ax_edid_set,
     .encoder_color_info = ax_encoder_color_info,
 };
 
