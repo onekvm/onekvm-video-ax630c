@@ -8,7 +8,7 @@ LDFLAGS := -shared -pthread
 
 all: host
 
-host: build/ax630c.so build/abi-smoke build/no-signal-test build/display-test build/display-capture-test build/hevc-header-test build/edid-test
+host: build/ax630c.so build/abi-smoke build/no-signal-test build/display-test build/display-capture-test build/hevc-header-test build/edid-test build/rate-control-test build/vcenc-rc-test
 
 build:
 	mkdir -p build
@@ -22,8 +22,8 @@ TRANSFORM := ../onekvm-generic-v4l2/src/v4l2_transform.c
 build/tdp-v4l2-test: tests/tdp-v4l2-test.c $(TRANSFORM) | build
 	$(CC) -O2 -Wall -Wextra $(INC) -o $@ $^
 
-build/ax630c.so: build/include/linux/axera_eip130.h $(TRANSFORM) src/ax630c_video.c src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_tdp.h src/ax_crypto.c src/ax_display.h src/no_signal_frames.inc $(wildcard third_party/vcenc-ewl/*.h) ../onekvm-core/include/onekvm/crypto_backend_v1.h ../onekvm-core/include/onekvm/video_backend_v1.h | build
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ src/ax630c_video.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_crypto.c $(TRANSFORM) -lcrypto
+build/ax630c.so: build/include/linux/axera_eip130.h $(TRANSFORM) src/ax630c_video.c src/ax_rate.c src/ax_rate.h src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_tdp.h src/ax_crypto.c src/ax_display.h src/no_signal_frames.inc $(wildcard third_party/vcenc-ewl/*.h) ../onekvm-core/include/onekvm/crypto_backend_v1.h ../onekvm-core/include/onekvm/video_backend_v1.h | build
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ src/ax630c_video.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_crypto.c $(TRANSFORM) -lcrypto -lm
 
 build/abi-smoke: tests/abi-smoke.c build/ax630c.so | build
 	$(CC) -O2 -Wall $(INC) -o $@ tests/abi-smoke.c -ldl
@@ -40,8 +40,14 @@ build/no-signal-test: tests/no-signal-test.c src/ax_no_signal.c src/ax_display.c
 build/display-test: tests/display-test.c src/ax_display.c src/ax_display.h | build
 	$(CC) -O2 -Wall -Wextra -Isrc -o $@ tests/display-test.c src/ax_display.c
 
-build/display-capture-test: $(TRANSFORM) tests/display-capture-test.c src/ax630c_video.c src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_tdp.h $(wildcard third_party/vcenc-ewl/*.h) | build
-	$(CC) $(CFLAGS) -pthread -Wl,--wrap=poll -Wl,--wrap=ioctl -Wl,--wrap=ax_tdp_convert -o $@ tests/display-capture-test.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c src/ax_tdp.c $(TRANSFORM)
+build/display-capture-test: $(TRANSFORM) tests/display-capture-test.c src/ax630c_video.c src/ax_rate.c src/ax_rate.h src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_tdp.h $(wildcard third_party/vcenc-ewl/*.h) | build
+	$(CC) $(CFLAGS) -pthread -Wl,--wrap=poll -Wl,--wrap=ioctl -Wl,--wrap=ax_tdp_convert -o $@ tests/display-capture-test.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c src/ax_tdp.c $(TRANSFORM) -lm
+
+build/rate-control-test: tests/rate-control-test.c src/ax_rate.c src/ax_rate.h $(wildcard third_party/vcenc-ewl/*.h) | build
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/rate-control-test.c src/ax_rate.c -lm
+
+build/vcenc-rc-test: tests/vcenc-rc-test.c $(wildcard third_party/vcenc-ewl/*.h) | build
+	$(CC) $(CFLAGS) -o $@ $< -lm
 
 build/edid-test: tests/edid-test.c src/ax_edid.c src/ax_edid.h | build
 	$(CC) $(CFLAGS) -Wl,--wrap=open -Wl,--wrap=access -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=close -o $@ tests/edid-test.c src/ax_edid.c
@@ -56,6 +62,8 @@ smoke: host
 	./build/display-capture-test
 	./build/hevc-header-test
 	./build/edid-test
+	./build/rate-control-test
+	./build/vcenc-rc-test
 
 clean:
 	rm -rf build

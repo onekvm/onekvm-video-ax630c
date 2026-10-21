@@ -44,6 +44,7 @@
 #include "ax_display.h"
 #include "ax_tdp.h"
 #include "ax_edid.h"
+#include "ax_rate.h"
 
 #define AX_DRIVER_ID "ax630c"
 #define AX_CAP_DEV "/dev/video0"
@@ -137,6 +138,7 @@ struct ax_encoder {
     uint32_t codec;
     atomic_uint color_info;
     uint32_t qp;
+    struct ax_rate rate;
     uint32_t gop;
     uint32_t fps;
     uint32_t seq;
@@ -760,6 +762,7 @@ static int ax_encoder_alloc_framebuf(struct ax_encoder *enc, uint32_t width,
         return -1;
     }
     enc->have_geom = 1;
+    enc->rate.ready = 0;
     return 0;
 }
 
@@ -890,10 +893,10 @@ static uint32_t ax_write_parameter_sets(struct ax_encoder *enc, uint8_t *out)
     uint32_t size;
 
     if (enc->codec == ONEKVM_VIDEO_CODEC_H265)
-        return vcenc_write_hevc_headers(out, enc->geom.w, enc->geom.h, enc->qp,
+        return vcenc_write_hevc_headers(out, enc->geom.w, enc->geom.h, enc->rate.initial_qp,
                                        vcenc_hevc_level_idc(enc->geom.w, enc->geom.h));
     size = vcenc_write_sps(out, enc->geom.w, enc->geom.h);
-    return size + vcenc_write_pps(out + size, enc->qp);
+    return size + vcenc_write_pps(out + size, enc->rate.initial_qp);
 }
 
 static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
@@ -902,6 +905,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
 {
     struct exchange_parameter ex;
     struct vcenc_frame fr;
+    struct vcenc_rc next_rate;
     uint16_t id, wid;
     uint32_t *slot;
     uint64_t core_dst;
@@ -936,10 +940,16 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
 
     memset(&fr, 0, sizeof(fr));
     fr.frame_num = gopn;
+    enc->qp = ax_rate_prepare(&enc->rate, &next_rate,
+                              hevc ? ENC_CODEC_HEVC : ENC_CODEC_H264,
+                              enc->geom.w, enc->geom.h,
+                              enc->placeholder ? 5 : enc->fps, enc->gop, is_idr);
     fr.qp = enc->qp;
+    fr.pic_init_qp = enc->rate.initial_qp;
     fr.codec = hevc ? ENC_CODEC_HEVC : ENC_CODEC_H264;
-    /* The HEVC PPS and hardware use the matching fixed-QP program. */
-    fr.rc_mode = hevc ? ENC_RC_FIXQP : ENC_RC_LEGACY;
+    /* Frame-level feedback selects QP; the hardware writes its slice delta
+     * against the stable PPS QP in the upper sw7 field. */
+    fr.rc_mode = ENC_RC_FIXQP;
     fr.input_phys = input_phys;
     au_slot = ax_au_acquire(enc);
     if (au_slot >= 0)
@@ -1033,6 +1043,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
         enc->dma_slot = -1;
     }
     enc->packet_key = is_idr ? 1u : 0u;
+    ax_rate_commit(&enc->rate, &next_rate, enc->packet_len);
     if (is_idr) {
         /* Published only after a successful AU with our actual SPS/VUI.
          * This describes the encoded stream, never the HDMI input depth. */
@@ -1042,9 +1053,10 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     }
     if (enc->logged < 8 || (enc->seq % 120u) == 0) {
         fprintf(stderr,
-                "ax630c: frame %u %s %s %ux%u bytes=%zu cycles=%u head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                "ax630c: frame %u %s %s %ux%u bytes=%zu cycles=%u qp=%u range=%u-%u target=%.0fkbps head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
                 enc->seq, hevc ? "H.265" : "H.264", is_idr ? "IDR" : "P", enc->geom.w, enc->geom.h,
-                enc->packet_len, swreg82,
+                enc->packet_len, swreg82, enc->qp, enc->rate.min_qp, enc->rate.max_qp,
+                enc->rate.controller.bitrate / 1000.0,
                 enc->publish[0], enc->publish[1], enc->publish[2], enc->publish[3],
                 enc->publish[4], enc->publish[5], enc->publish[6],
                 enc->packet_len > 7 ? enc->publish[7] : 0);
@@ -1469,7 +1481,12 @@ static int32_t ax_encoder_create(const struct onekvm_video_encoder_config_v1 *co
     atomic_init(&enc->color_info, 0);
     enc->codec = config->codec == ONEKVM_VIDEO_CODEC_H265
         ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
-    enc->qp = ENC_QP_FIXED;
+    if (ax_rate_configure(&enc->rate, config)) {
+        free(enc);
+        ax_err(error, error_cap, "invalid AX630C rate control configuration");
+        return -1;
+    }
+    enc->qp = enc->rate.initial_qp;
     enc->gop = 30;
     enc->fps = 60;
     if (config->struct_size >= offsetof(struct onekvm_video_encoder_config_v1, gop) +
@@ -1478,8 +1495,6 @@ static int32_t ax_encoder_create(const struct onekvm_video_encoder_config_v1 *co
         enc->gop = (uint32_t)config->gop;
     if (config->fps > 0)
         enc->fps = (uint32_t)config->fps;
-    if (config->initial_qp >= 16 && config->initial_qp <= 51)
-        enc->qp = (uint32_t)config->initial_qp;
     *encoder = enc;
     return 0;
 }
@@ -1500,12 +1515,15 @@ static int32_t ax_encoder_reset(void *encoder,
         ax_err(error, error_cap, "ax630c backend encodes H.264 and H.265");
         return -1;
     }
+    if (ax_rate_configure(&enc->rate, config)) {
+        ax_err(error, error_cap, "invalid AX630C rate control configuration");
+        return -1;
+    }
     if (config->gop > 1)
         enc->gop = (uint32_t)config->gop;
     if (config->fps > 0)
         enc->fps = (uint32_t)config->fps;
-    if (config->initial_qp >= 16 && config->initial_qp <= 51)
-        enc->qp = (uint32_t)config->initial_qp;
+    enc->qp = enc->rate.initial_qp;
     enc->codec = config->codec == ONEKVM_VIDEO_CODEC_H265
         ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
     enc->force_idr = 1;
@@ -1527,10 +1545,12 @@ static int32_t ax_encoder_encode(void *encoder, const struct onekvm_video_frame_
 static int32_t ax_encoder_set_quality(void *encoder, double quality_factor,
                                       char *error, uint32_t error_cap)
 {
-    (void)encoder;
-    (void)quality_factor;
-    (void)error;
-    (void)error_cap;
+    struct ax_encoder *enc = encoder;
+
+    if (!enc || ax_rate_set_quality(&enc->rate, quality_factor)) {
+        ax_err(error, error_cap, "invalid AX630C quality factor");
+        return -1;
+    }
     return 0;
 }
 
@@ -2072,6 +2092,7 @@ int main(int argc, char **argv)
         ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
     ec.gop = 30;
     ec.fps = 60;
+    ec.quality_factor = 0.5;
     if (ax_encoder_create(&ec, &encoder, error, sizeof(error)) != 0) {
         fprintf(stderr, "encoder_create: %s\n", error);
         return 1;

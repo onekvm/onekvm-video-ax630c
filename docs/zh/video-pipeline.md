@@ -6,7 +6,15 @@
 
 后端 ABI 和设备描述同时声明 `auto`、`h264`、`h265`。后端独立打开 `auto` 时选择 H.264；网页在自动模式建立连接时提交浏览器已验证的编码偏好，由 Core 在首个视频会话注册前选择 H.265 或 H.264，持久配置仍为 `auto`。H.265 使用 VC8000E 的 HEVC Main、8-bit 4:2:0 硬件编码路径，不在 CPU 上做视频软件编码。创建、重置、编码器查询及每个输出包都必须使用实际选中的格式，不能只开放配置选项。
 
-H.264 沿用原来的 `ENC_RC_LEGACY` 寄存器程序；H.265 使用 `ENC_CODEC_HEVC` 与 `ENC_RC_FIXQP`，PPS 的初始 QP 与硬件帧 QP 保持一致。HEVC 参数集由 `third_party/vcenc-ewl/vcenc_hevc_header.h` 生成，来源和许可见该目录的 `UPSTREAM.md`。每个 H.265 IDR 前补齐 VPS/SPS/PPS（NAL 32/33/34），接 IDR NAL 19；普通 P 帧为 NAL 1。编码器不输出 B 帧，参数集声明无重排。尺寸按最小编码块对齐并用 conformance window 裁回实际画幅，level 按图像尺寸及 60 fps 上界选择。
+H.264/H.265 均使用 `ENC_RC_FIXQP` 寄存器程序，由帧级控制器根据实际出包大小
+在 QP 范围内调节。`initial_qp` 只设初始值；当前寄存器表支持 QP 16–51，
+配置范围与其取交集。自动目标按像素数、帧率和 `quality_factor` 缩放，
+1080p60、画质 0.5 对应 5 Mbps；显式 `bitrate_kbps` 覆盖自动目标。
+QP 到达上限时码率仍可能超过目标，不通过丢帧或输出填充保证固定码率。
+PPS 保持初始 QP，硬件通过 slice QP delta 表达逐帧变化。反馈只计入成功的完整 AU，
+质量调整从下一帧生效；尺寸重建重新初始化控制器。
+
+HEVC 参数集由 `third_party/vcenc-ewl/vcenc_hevc_header.h` 生成，来源和许可见该目录的 `UPSTREAM.md`。每个 H.265 IDR 前补齐 VPS/SPS/PPS（NAL 32/33/34），接 IDR NAL 19；普通 P 帧为 NAL 1。编码器不输出 B 帧，参数集声明无重排。尺寸按最小编码块对齐并用 conformance window 裁回实际画幅，level 按图像尺寸及 60 fps 上界选择。
 
 切换格式时强制生成新的 IDR；实时画面、输出缩放和无信号占位共用选中的编码路径。浏览器能否播放还取决于当前传输协议下的 HEVC 解码能力；自动模式优先使用已通过 WebRTC／WebSocket 探测的 H.265，不支持时回落 H.264。有视频会话占用共享编码器时，后来的连接沿用当前编码，不能覆盖主会话或扩展的编码选择。
 
