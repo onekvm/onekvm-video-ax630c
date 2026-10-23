@@ -1,22 +1,43 @@
-# AX630C 加密 offload ABI
+# AX630C 软件加密策略
 
-`ax630c.so` 同时导出 video ABI 与
+生产 `ax630c.so` 只发布视频／解码能力，不编入 `ax_crypto.c`，不导出
+`onekvm_crypto_backend_query`。设备描述仅声明 `video`，Core 不会将 AX630C 注册为
+硬件加密提供方；扩展也不会通过该后端获得硬件加密能力。
+
+AX630C 后端包安装 `onekvm.service.d/20-ax630c-software-srtp.conf`，选择
+`ONEKVM_WEBRTC_SRTP_PROFILE=aes-cm` 和 `ONEKVM_SRTP_AES_CM_OFFLOAD=software`。
+因此设备默认使用软件 AES-CM，取消硬件能力后不会转为通用的无提供方 GCM 默认值。
+软件计算复用 Core 通用 SRTP 的 OpenSSL AES-CTR 与 Rust HMAC-SHA1 实现；
+芯片策略和能力发布留在后端包，Core 不增加 AX630C 专属分支。
+
+H.264/H.265 继续使用 VC8000E 硬件编码，缩放、预览和硬件解码不受此策略影响。
+本策略只取消硬件加密的应用接口，不移除内核 EIP-130 驱动或修改固件。
+
+下面是保留源码的历史实验约定，仅用于独立开发诊断；生产库不再提供这些接口，
+设备诊断包也不再安装依赖该 Crypto ABI 的 `ax630c-crypto-test`。
+
+## 历史硬件加密实现
+
+旧实验版 `ax630c.so` 同时导出 video ABI 与
 [`onekvm_crypto_backend_query`](../../../onekvm-core/include/onekvm/crypto_backend_v1.h)。
 复用 Core 的 Crypto Backend ABI v1，不增加 Pro 专用的应用协议。
 应用先检查 ABI major、`struct_size`、feature 和函数指针，再调用 `probe`。
 完整调用约定见 [Core ABI 文档](../../../onekvm-core/docs/crypto-backend-abi-v1.md)。
 
-## 算法与边界
+### 算法与边界
 
 | 能力 | 实现 | 限制 |
 | --- | --- | --- |
 | AES-CTR | EIP-130 硬件 AES | 128/192/256-bit key；完整 16-byte 大端 counter |
 | AES-GCM TX | EIP-130 批量 AES + OpenSSL GHASH | 128/256-bit key；12-byte nonce；16-byte tag |
 | GCM batch | 合并多个包的 counter blocks，一次 ECB 提交 | 最多 32 项；`completed` 只报告成功前缀 |
+| AES-CM TX batch | EIP-130 批量 AES + OpenSSL HMAC-SHA1 | AES-128；36-byte AES/HMAC 组合密钥；4/10-byte tag；最多 32 项 |
 
 GCM 是部分硬件卸载，不声明 EIP-130 原生 GCM 或硬件 GHASH。
 厂商公开 token 接口缺少完整的 GCM AAD/tag 布局，不能把 GCM 枚举当作可用实现。
-不声明 HMAC-SHA1。descriptor 的 `srtp-tx-offload` 与 `CONCURRENT_H265_VIDEO`
+不声明独立的硬件 `HMAC_SHA1` 能力；AES-CM 的认证在软件中完成。
+`AES_CM_TX_BATCH` 表示完整包的组合回调，允许部分硬件卸载。
+descriptor 的 `srtp-tx-offload` 与 `CONCURRENT_H265_VIDEO`
 用于 Core 的 H.264/H.265 SRTP TX；105 已通过浏览器 H.264 播放及 90 秒 H.265
 WebRTC/加密并发验证，接收 5427 帧，无序号缺口、完整码流解码零错误。
 
@@ -26,11 +47,23 @@ WebRTC/加密并发验证，接收 5427 帧，无序号缺口、完整码流解�
 软件 AES。无法匹配的 counter 或失败的硬件提交直接返回错误。常见 8×1200-byte
 RTP 批次只提交一次 AES；超过 65552-byte staging 容量的 batch 分组提交。
 
+AES-CM 复用同样的 ECB 聚合方式，生成每个包的完整 128-bit 大端递增 counter，
+将硬件生成的 keystream 与 payload 异或，再认证明文 RTP header、密文及大端 ROC。
+空 payload 仅认证，不提交 AES。每个会话一次分配两个 65552-byte staging 和 HMAC
+上下文，逐包重置已设密钥的 HMAC 状态；回调不分配包缓冲区。没有跨帧等待，额外
+分组仅由现有批次或 staging 容量触发；不仅减少用户／内核切换，也减少硬件任务和
+完成中断次数。无需修改内核 UAPI。单个 RTP 包加四字节 ROC 不超过 65536 bytes。
+counter 以两个大端 64-bit 字生成并传播进位；payload 按 64-bit 字异或，尾部逐字节
+处理。通过 `memcpy` 读写字，兼容非对齐地址、严格别名和完全原地加密；循环长度保留
+在局部值中，避免每字节重读可与输出别名的 request 元数据。
+支持 batch 的 Core 默认选择 AES-CM 并调用 `ctr-hmac-batch`；名称表示组合操作，
+在 Pro 上不表示硬件 HMAC。显式 `gcm`、`ctr` 和 `software` 选择仍保留。
+
 单个 CTR 输入最多 65536 bytes；GCM 的 AAD 与明文合计最多 65536 bytes。
 支持任意字节长度、非对齐地址和完全原地处理，`payload_alignment=1`。
 CTR 空输入直接成功；GCM 空明文仍输出认证标签。AES key 只保存在内核 keyed
 transform 中；派生的 H、GHASH 表和临时 keystream 属于秘密材料。每次返回前清除
-counter/keystream staging，销毁时清理 H、GCM context、缓冲区并关闭所有 fd。
+counter/keystream staging，销毁时清理 H、GCM/HMAC context、缓冲区并关闭所有 fd。
 
 `flags` 必须为零；不支持的算法、密钥、nonce、tag、地址、大小在提交之前拒绝。
 失败时 `output_size=0`；调用方丢弃失败输出。batch 失败后不能使用失败项及其后续项。
@@ -40,7 +73,7 @@ Core 丢弃失败批次，等待后再次尝试硬件；恢复期间不执行软
 同一个 session 不可并发调用；不同 session 可以并发，由内核串行调度共享引擎。
 nonce/counter 由调用方分配，同一把密钥下不得重用；插件不分配协议序号。
 
-## 内核与权限
+### 内核与权限
 
 Linux 6.18 驱动在 `linux-6.18-ax620e/drivers/crypto/axera/`。
 配置 `CONFIG_CRYPTO_DEV_AXERA_EIP130=m`，设备树匹配 `axera,ax630c-eip130`。
@@ -86,11 +119,11 @@ root 向同一平台设备的 `recover` 写入 `1`，可在工作线程互斥锁
 root 可向 `/sys/module/axera_eip130/parameters/fault_timeout_once` 写入 1，测试一次
 丢弃完成中断后的超时隔离；该接口只用于测试。
 
-## 构建与验证
+### 历史构建与验证
 
 设备产物只通过 `onekvm-distro` OE/kas 构建；调试使用
 `ONEKVM_DEBUG_WORKTREES=linux-6.18-ax620e,onekvm-video-ax630c`。
-`onekvm-video-ax630c-diag` 的 `ax630c-crypto-test` 会动态装载实际共享库，
+旧版 `onekvm-video-ax630c-diag` 的 `ax630c-crypto-test` 曾动态装载实验共享库，
 与 OpenSSL 对照不同密钥、长度、AAD 和原地处理，验证 counter carry、batch 部分失败、
 错误标签/AAD 拒绝、跨 staging 分组的 32 项混合 batch 及四个并发 session，
 再输出同步请求微基准。`ax630c-eip130-ioctl-test` 验证原生 UAPI 的元数据、
@@ -115,7 +148,7 @@ onekvm-crypto-bench --mode hardware --payload 1200 --batch 8 --mbps 20 --seconds
 `tools/crypto-stage-profile.py` 用相同操作频率比较 GCM、CTR(N+16) 和短 CTR，
 记录调用进程/crypto_engine 线程 CPU、IRQ 和 IPI。它用于区分 GHASH、数据搬运和
 每次提交的固定成本；Python 自身开销不作为正式软硬件 CPU 对照。
-修改实现后须重复实际 SRTP 接收、解密、视频解码和 H.265 并发验证；
+历史硬件实验要求验证实际 SRTP 接收、解密、视频解码和 H.265 并发；
 不能只凭进程 CPU 或单独加密吞吐声称音频总 CPU 达到 5%。
 105 的固定码率、饱和吞吐和整机 CPU 三轮对照见
 [Pro 硬件加密](../../../onekvm-distro/docs/nanokvm-pro-crypto.md#验证与性能测量)。

@@ -4,7 +4,7 @@
   "transport": "native",
   "driver": "ax630c",
   "library": "/usr/lib/onekvm/video-backends/ax630c.so",
-  "capabilities": ["video", "srtp-tx-offload"],
+  "capabilities": ["video"],
   "video_codecs": ["auto", "h264", "h265"],
   "video_formats": [
     {"Width": 1920, "Height": 1080, "FPS": 60, "PixelFormat": "yuyv"},

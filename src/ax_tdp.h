@@ -15,4 +15,10 @@ void ax_tdp_close(struct ax_tdp *tdp);
  * as a negative errno; this function never performs software conversion. */
 int ax_tdp_convert(struct ax_tdp *tdp, uint8_t *out, uint32_t dw, uint32_t dh,
                    int input_fd, uint32_t stride, uint32_t sw, uint32_t sh);
+/* Full-size snapshot: cached output is borrowed until release. The caller
+ * must serialize acquire/release and keep the transform alive while borrowed. */
+int ax_tdp_snapshot_acquire(struct ax_tdp *tdp, struct onekvm_v4l2_transform_frame *frame,
+                            uint32_t dw, uint32_t dh,
+                    int input_fd, uint32_t stride, uint32_t sw, uint32_t sh);
+void ax_tdp_snapshot_release(struct ax_tdp *tdp);
 #endif

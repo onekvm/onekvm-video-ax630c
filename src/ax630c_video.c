@@ -23,6 +23,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <pthread.h>
@@ -45,15 +46,15 @@
 #include "ax_tdp.h"
 #include "ax_edid.h"
 #include "ax_rate.h"
+#include "ax_snapshot.h"
+#include "ax_pacing.h"
 
 #define AX_DRIVER_ID "ax630c"
 #define AX_CAP_DEV "/dev/video0"
 /* Power-of-two, matching the capture carveout's DMA bitmap slots. */
 #define AX_MAX_BUFS 8
-/* Bitstream DMA ring. The viewer ring keeps its own copy of each AU, so a
- * slow client cannot pin the venc carveout. Eight slots cover the frames
- * still in flight between the hardware write and that handoff. */
-#define AX_AU_RING 8
+/* Parameter sets precede the slice in the fixed encoder output region.
+ * Core copies the borrowed AU before the next encode; clients cannot pin it. */
 #define AX_AU_HEADROOM 256
 #define AX_PROC_W "/proc/lt6911_info/width"
 #define AX_PROC_H "/proc/lt6911_info/height"
@@ -67,7 +68,6 @@
 /* The bridge needs about 2.5 s from "disappear" to a new CSI mode. Sending a
  * placeholder IDR midway can make browsers buffer the next 60+ live frames. */
 #define AX_SIGNAL_LOSS_GRACE_MS 3200u
-#define AX_PLACEHOLDER_INTERVAL_MS 200u
 #define AX_MODE_POLL_INTERVAL_MS 100u
 
 struct ax_source {
@@ -93,6 +93,21 @@ struct ax_source {
     int display_worker_started, display_worker_stop;
     int display_job_index, display_job_complete;
     uint32_t display_job_stride, display_job_width, display_job_height;
+    int32_t display_job_resolution;
+    uint64_t display_job_snapshot_generation;
+    /* One request borrows the TDP cached RGB output through compression.
+     * VIN is returned as soon as conversion completes, before JPEG encoding. */
+    pthread_mutex_t snapshot_gate, snapshot_lock;
+    pthread_cond_t snapshot_cv;
+    atomic_int snapshot_pending;
+    atomic_uint_fast64_t encoded_requested_ms;
+    struct onekvm_v4l2_transform_frame snapshot_frame;
+    struct ax_jpeg *snapshot_jpeg;
+    uint32_t snapshot_width, snapshot_height;
+    atomic_uint_fast64_t snapshot_generation;
+    uint64_t snapshot_pts;
+    int snapshot_status;
+    struct ax_tdp snapshot_hw;
     int cap_fd;
     int wake_fd;
     atomic_int interrupted;
@@ -114,18 +129,6 @@ struct ax_source {
     uint32_t dma_phys[AX_MAX_BUFS];
 };
 
-struct ax_au_slot {
-    struct framebuf_parameter fb;
-    uint8_t *map;
-    uint32_t slice_phys;
-    atomic_int busy;
-};
-
-struct ax_au_owner {
-    uint8_t *data;
-    uint32_t size;
-};
-
 struct ax_encoder {
     int venc_fd;
     uint32_t *cmd;
@@ -142,6 +145,7 @@ struct ax_encoder {
     uint32_t gop;
     uint32_t fps;
     uint32_t seq;
+    struct ax_pacer pacer;
     int force_idr;
     struct ax_source *bound;
     uint32_t bound_w;
@@ -155,18 +159,11 @@ struct ax_encoder {
     uint32_t early_prev_w;
     uint32_t early_prev_h;
     int placeholder;
-    uint8_t *packet;
-    size_t packet_cap;
     size_t packet_len;
     uint32_t packet_key;
     uint64_t packet_pts;
     uint64_t encode_ns;
     unsigned logged;
-    struct ax_au_slot au[AX_AU_RING];
-    int au_count;
-    int au_next;
-    int au_ready;
-    int dma_slot;
     uint8_t *publish;
 };
 
@@ -361,6 +358,43 @@ static void ax_queue_capture_index(struct ax_source *src, uint32_t index)
         fprintf(stderr, "ax630c: QBUF %u: %s\n", index, strerror(errno));
 }
 
+static void ax_output_size(int32_t resolution, uint32_t input_w, uint32_t input_h,
+                           uint32_t *width, uint32_t *height);
+
+/* The worker borrows the producer's dequeued buffer. Never acquires VIN. */
+static void ax_capture_snapshot(struct ax_source *src, unsigned index,
+                                uint32_t stride, uint32_t width, uint32_t height,
+                                int32_t resolution, uint64_t generation)
+{
+    pthread_mutex_lock(&src->snapshot_lock);
+    if (!atomic_load(&src->snapshot_pending) ||
+        generation != atomic_load(&src->snapshot_generation)) {
+        pthread_mutex_unlock(&src->snapshot_lock);
+        return;
+    }
+    uint32_t w = src->snapshot_width, h = src->snapshot_height;
+    if (!w) ax_output_size(resolution, width, height, &w, &h);
+    int rc = -EINVAL;
+    if (w && h && !(w & 1u) && w <= 4096 && h <= 2400) {
+        struct v4l2_exportbuffer exp = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .index = index, .flags = O_CLOEXEC,
+        };
+        rc = -EIO;
+        if (ioctl(src->cap_fd, VIDIOC_EXPBUF, &exp) == 0) {
+            rc = ax_tdp_snapshot_acquire(&src->snapshot_hw, &src->snapshot_frame,
+                                         w, h, exp.fd, stride, width, height);
+            close(exp.fd);
+        }
+    }
+    src->snapshot_width = w; src->snapshot_height = h;
+    src->snapshot_pts = ax_now_ns();
+    src->snapshot_status = rc;
+    atomic_store(&src->snapshot_pending, 0);
+    pthread_cond_broadcast(&src->snapshot_cv);
+    pthread_mutex_unlock(&src->snapshot_lock);
+}
+
 static void *ax_display_worker(void *arg)
 {
     struct ax_source *src = arg;
@@ -377,7 +411,10 @@ static void *ax_display_worker(void *arg)
         size_t size = src->map_len[index];
         uint32_t stride = src->display_job_stride;
         uint32_t width = src->display_job_width, height = src->display_job_height;
+        int32_t resolution = src->display_job_resolution;
+        uint64_t generation = src->display_job_snapshot_generation;
         pthread_mutex_unlock(&src->display_job_lock);
+        ax_capture_snapshot(src, index, stride, width, height, resolution, generation);
         ax_publish_display(src, frame, size, stride, width, height, (int)index);
         pthread_mutex_lock(&src->display_job_lock);
         src->display_job_complete = 1;
@@ -421,8 +458,10 @@ static void ax_schedule_display(struct ax_source *src, uint32_t stride)
     uint64_t attempted = atomic_load(&src->display_attempted_ms);
     uint64_t now = ax_now_ms();
     if (!src->display_worker_started || !src->held || src->nbufs < 3 ||
-        atomic_load(&src->interrupted) || !requested || now - requested >= 2000 ||
-        (attempted && now - attempted < 66))
+        atomic_load(&src->interrupted) ||
+        (!atomic_load(&src->snapshot_pending) &&
+         (!requested || now - requested >= 2000 ||
+          (attempted && now - attempted < 66))))
         return;
     ax_collect_display_job(src, 0, 1);
     pthread_mutex_lock(&src->display_job_lock);
@@ -432,6 +471,8 @@ static void ax_schedule_display(struct ax_source *src, uint32_t stride)
         src->display_job_stride = stride;
         src->display_job_width = src->width;
         src->display_job_height = src->height;
+        src->display_job_resolution = src->output_resolution;
+        src->display_job_snapshot_generation = atomic_load(&src->snapshot_generation);
         pthread_cond_signal(&src->display_job_cv);
     }
     pthread_mutex_unlock(&src->display_job_lock);
@@ -814,80 +855,6 @@ static void ax_output_size(int32_t resolution, uint32_t input_w, uint32_t input_
     }
 }
 
-static void ax_au_ring_free(struct ax_encoder *enc)
-{
-    int i;
-
-    if (!enc)
-        return;
-    for (i = 0; i < enc->au_count; i++) {
-        if (enc->au[i].map && enc->au[i].map != MAP_FAILED)
-            munmap(enc->au[i].map, enc->au[i].fb.size);
-        enc->au[i].map = NULL;
-        if (enc->venc_fd >= 0 && enc->au[i].fb.bus_addr &&
-            !atomic_load(&enc->au[i].busy))
-            ioctl(enc->venc_fd, HANTRO_IOCH_FREE_FRAMEBUF, &enc->au[i].fb);
-        enc->au[i].fb.bus_addr = 0;
-        enc->au[i].slice_phys = 0;
-        atomic_store(&enc->au[i].busy, 0);
-    }
-    enc->au_count = 0;
-    enc->au_ready = 0;
-}
-
-static int ax_au_ring_alloc(struct ax_encoder *enc)
-{
-    uint32_t bytes;
-    int i;
-
-    if (enc->au_ready)
-        return enc->au_count;
-    bytes = (enc->geom.out_limit + AX_AU_HEADROOM + 4095u) & ~4095u;
-    for (i = 0; i < AX_AU_RING; i++) {
-        struct framebuf_parameter fb;
-        void *map;
-
-        memset(&fb, 0, sizeof(fb));
-        fb.size = bytes;
-        if (ioctl(enc->venc_fd, HANTRO_IOCH_ALLOC_FRAMEBUF, &fb) < 0 ||
-            fb.bus_addr > 0xfffffffful)
-            break;
-        map = ax_map_pool(enc->venc_fd, fb.bus_addr, fb.size);
-        if (!map) {
-            ioctl(enc->venc_fd, HANTRO_IOCH_FREE_FRAMEBUF, &fb);
-            break;
-        }
-        enc->au[i].fb = fb;
-        enc->au[i].map = map;
-        enc->au[i].slice_phys = (uint32_t)fb.bus_addr + AX_AU_HEADROOM;
-        atomic_store(&enc->au[i].busy, 0);
-    }
-    enc->au_count = i;
-    enc->au_next = 0;
-    enc->au_ready = 1;
-    fprintf(stderr, "ax630c: DMA bitstream ring %d slots\n", enc->au_count);
-    return enc->au_count;
-}
-
-/* Returns a slot index, or -1 when every slot is still borrowed. */
-static int ax_au_acquire(struct ax_encoder *enc)
-{
-    int i;
-
-    if (enc->au_count <= 0)
-        return -1;
-    for (i = 0; i < enc->au_count; i++) {
-        int idx = (enc->au_next + i) % enc->au_count;
-        int expected = 0;
-
-        if (atomic_compare_exchange_strong(&enc->au[idx].busy, &expected, 1)) {
-            enc->au_next = (idx + 1) % enc->au_count;
-            return idx;
-        }
-    }
-    return -1;
-}
-
 static uint32_t ax_write_parameter_sets(struct ax_encoder *enc, uint8_t *out)
 {
     uint32_t size;
@@ -914,13 +881,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     uint32_t swreg9, swreg82, hlen = 0;
     uint64_t t0;
     int nut;
-    int au_slot;
     int hevc = enc->codec == ONEKVM_VIDEO_CODEC_H265;
-
-    if (enc->dma_slot >= 0) {
-        atomic_store(&enc->au[enc->dma_slot].busy, 0);
-        enc->dma_slot = -1;
-    }
 
     if (!input_phys) {
         if (!yuyv)
@@ -943,7 +904,8 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     enc->qp = ax_rate_prepare(&enc->rate, &next_rate,
                               hevc ? ENC_CODEC_HEVC : ENC_CODEC_H264,
                               enc->geom.w, enc->geom.h,
-                              enc->placeholder ? 5 : enc->fps, enc->gop, is_idr);
+                              enc->placeholder ? 5 : ax_nominal_fps(enc->bound->fps),
+                              enc->gop, is_idr);
     fr.qp = enc->qp;
     fr.pic_init_qp = enc->rate.initial_qp;
     fr.codec = hevc ? ENC_CODEC_HEVC : ENC_CODEC_H264;
@@ -951,9 +913,10 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
      * against the stable PPS QP in the upper sw7 field. */
     fr.rc_mode = ENC_RC_FIXQP;
     fr.input_phys = input_phys;
-    au_slot = ax_au_acquire(enc);
-    if (au_slot >= 0)
-        fr.output_phys = enc->au[au_slot].slice_phys;
+    /* Pack parameter sets immediately before the hardware slice. The ABI
+     * borrows one AU until the next encoder call, so the existing floorplan
+     * output is sufficient; no separate DMA ring or heap copy is needed. */
+    fr.output_phys = (uint32_t)enc->fb.bus_addr + enc->geom.off_out + AX_AU_HEADROOM;
     slot = enc->cmd + (size_t)id * (enc->mem.cmd_unit_size / 4);
     ex.cmdbuf_size = vcenc_build_encode_cmdbuf(slot, (uint32_t)enc->fb.bus_addr,
                                                &enc->geom, core_dst, &fr);
@@ -961,15 +924,11 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     if (!ex.cmdbuf_size) {
         wid = id;
         ioctl(enc->venc_fd, HANTRO_IOCH_RELEASE_CMDBUF, &wid);
-        if (au_slot >= 0)
-            atomic_store(&enc->au[au_slot].busy, 0);
         return -1;
     }
     if (ioctl(enc->venc_fd, HANTRO_IOCH_LINK_RUN_CMDBUF, &ex) < 0) {
         wid = id;
         ioctl(enc->venc_fd, HANTRO_IOCH_RELEASE_CMDBUF, &wid);
-        if (au_slot >= 0)
-            atomic_store(&enc->au[au_slot].busy, 0);
         return -1;
     }
     wid = id;
@@ -977,8 +936,6 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     if (ioctl(enc->venc_fd, HANTRO_IOCH_WAIT_CMDBUF, &wid) < 0) {
         uint16_t rid = id;
         ioctl(enc->venc_fd, HANTRO_IOCH_RELEASE_CMDBUF, &rid);
-        if (au_slot >= 0)
-            atomic_store(&enc->au[au_slot].busy, 0);
         return -1;
     }
     /* Preserve this AU's observed hardware completion through publication. */
@@ -988,10 +945,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     regs = (volatile uint32_t *)(enc->status + STATUS_SLOT_REG_OFF(id, 0));
     swreg9 = regs[9];
     swreg82 = regs[82];
-    if (au_slot >= 0)
-        slice = (volatile uint8_t *)(enc->au[au_slot].map + AX_AU_HEADROOM);
-    else
-        slice = (volatile uint8_t *)(enc->fb_map + enc->geom.off_out + ENC_STREAM_SUBOFF);
+    slice = enc->fb_map + enc->geom.off_out + AX_AU_HEADROOM;
     nut = swreg9 > (hevc ? 5u : 4u)
         ? (hevc ? (slice[4] >> 1) & 0x3f : slice[4] & 0x1f) : -1;
     {
@@ -1004,44 +958,18 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
         fprintf(stderr,
                 "ax630c: encode reject idr=%d wait=%u bytes=%u cycles=%u nal=%d\n",
                 is_idr, wid, swreg9, swreg82, nut);
-        if (au_slot >= 0)
-            atomic_store(&enc->au[au_slot].busy, 0);
         return -1;
     }
 
-    if (au_slot >= 0) {
-        uint8_t *au = (uint8_t *)slice;
-
-        if (is_idr) {
-            uint8_t hdr[AX_AU_HEADROOM];
-
-            hlen = ax_write_parameter_sets(enc, hdr);
-            if (hlen > AX_AU_HEADROOM) {
-                atomic_store(&enc->au[au_slot].busy, 0);
-                return -1;
-            }
-            memcpy((uint8_t *)slice - hlen, hdr, hlen);
-            au = (uint8_t *)slice - hlen;
-        }
-        enc->publish = au;
-        enc->packet_len = hlen + swreg9;
-        enc->dma_slot = au_slot;
-    } else {
-        if (enc->packet_cap < (size_t)swreg9 + 256) {
-            uint8_t *grown = realloc(enc->packet, (size_t)swreg9 + 256);
-            if (!grown)
-                return -1;
-            enc->packet = grown;
-            enc->packet_cap = (size_t)swreg9 + 256;
-        }
-        if (is_idr) {
-            hlen = ax_write_parameter_sets(enc, enc->packet);
-        }
-        memcpy(enc->packet + hlen, (const void *)slice, swreg9);
-        enc->publish = enc->packet;
-        enc->packet_len = hlen + swreg9;
-        enc->dma_slot = -1;
+    if (is_idr) {
+        uint8_t hdr[AX_AU_HEADROOM];
+        hlen = ax_write_parameter_sets(enc, hdr);
+        if (hlen > AX_AU_HEADROOM)
+            return -1;
+        memcpy((uint8_t *)slice - hlen, hdr, hlen);
     }
+    enc->publish = (uint8_t *)slice - hlen;
+    enc->packet_len = hlen + swreg9;
     enc->packet_key = is_idr ? 1u : 0u;
     ax_rate_commit(&enc->rate, &next_rate, enc->packet_len);
     if (is_idr) {
@@ -1142,6 +1070,107 @@ static int ax_grab_frame(struct ax_source *src, const uint8_t **data,
     return ax_grab_frame_budget(src, data, stride, error, error_cap, 0);
 }
 
+/* VIN is nonblocking. Discard only completed raw frames, before either the
+ * encoder or preview borrows them. Bound the drain to one capture pool so a
+ * fast producer cannot keep this thread in the loop indefinitely. */
+static int ax_latest_capture(struct ax_source *src, const uint8_t **data,
+                              char *error, uint32_t error_cap)
+{
+    for (unsigned i = 1; i < src->nbufs; i++) {
+        struct v4l2_buffer buf = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+        };
+        if (ioctl(src->cap_fd, VIDIOC_DQBUF, &buf) < 0) {
+            if (errno == EAGAIN || errno == EINTR) return 0;
+            ax_err_errno(error, error_cap, "drain capture");
+            ax_requeue(src);
+            return -1;
+        }
+        if (buf.index >= src->nbufs || !src->map[buf.index] ||
+            buf.index == src->held_index) {
+            ax_err(error, error_cap, "drain capture buffer index");
+            if (buf.index < src->nbufs && buf.index != src->held_index)
+                ax_queue_capture_index(src, buf.index);
+            ax_requeue(src);
+            return -1;
+        }
+        ax_requeue(src);
+        src->held = 1;
+        src->held_index = buf.index;
+        *data = src->map[buf.index];
+    }
+    return 0;
+}
+
+/* At very low video rates, drain VIN while waiting so a full DONE queue cannot
+ * freeze the newest available frame for most of a one-second interval. Also
+ * service snapshot/small-display demand without running VENC for these frames. */
+static void ax_service_auxiliary(struct ax_source *src)
+{
+    if (pthread_mutex_trylock(&src->lock) != 0)
+        return;
+    if (src->streaming && !atomic_load(&src->interrupted)) {
+        const uint8_t *frame;
+        uint32_t stride;
+        char error[128];
+        if (ax_grab_frame_budget(src, &frame, &stride, error, sizeof(error), 1) == 0) {
+            if (ax_latest_capture(src, &frame, error, sizeof(error)) == 0)
+                ax_schedule_display(src, stride);
+            ax_requeue(src);
+        }
+    }
+    pthread_mutex_unlock(&src->lock);
+}
+
+/* Wait without VIN locked. Source interruption wakes this wait immediately,
+ * including low configured frame rates. Do not report pacing as capture time. */
+static int ax_wait_encode_slot(struct ax_encoder *enc, struct ax_source *src,
+                               char *error, uint32_t error_cap)
+{
+    uint64_t deadline = ax_pacer_deadline(&enc->pacer, enc->fps,
+                                         ax_nominal_fps(src->fps));
+    while (deadline && ax_now_ns() < deadline) {
+        if (atomic_load(&src->interrupted)) return -1;
+        uint64_t now = ax_now_ns();
+        if (now >= deadline) break;
+        if (enc->fps < 15) ax_service_auxiliary(src);
+        now = ax_now_ns();
+        if (now >= deadline) break;
+        int wait_ms = (int)((deadline - now + 999999) / 1000000);
+        if (enc->fps < 15 && wait_ms > 20) wait_ms = 20;
+        struct pollfd wake = {.fd = src->wake_fd, .events = POLLIN};
+        int rc = poll(&wake, src->wake_fd >= 0 ? 1 : 0, wait_ms);
+        if (rc < 0 && errno != EINTR) {
+            ax_err_errno(error, error_cap, "wait video cadence");
+            return -1;
+        }
+        if (rc > 0 && (wake.revents & POLLIN)) {
+            uint64_t junk;
+            if (src->wake_fd >= 0) read(src->wake_fd, &junk, sizeof(junk));
+            ax_err(error, error_cap, "capture interrupted");
+            return -1;
+        }
+    }
+    return atomic_load(&src->interrupted) ? -1 : 0;
+}
+
+static void ax_packet_duration(struct ax_encoder *enc, struct ax_source *src,
+                               struct onekvm_video_packet_v1 *packet)
+{
+#ifdef ONEKVM_VIDEO_PACKET_V1_BASE_SIZE
+    /* Optional ABI tail; deployed older Core callers still pass the base size. */
+    if (packet->struct_size >= offsetof(struct onekvm_video_packet_v1, duration_ns) +
+                               sizeof(packet->duration_ns)) {
+        uint32_t input = enc->placeholder ? 5 : ax_nominal_fps(src->fps);
+        uint32_t fps = input < enc->fps ? input : enc->fps;
+        packet->duration_ns = 1000000000ull / (fps ? fps : 60);
+    }
+#else
+    (void)enc; (void)src; (void)packet;
+#endif
+}
+
 static void ax_requeue(struct ax_source *src)
 {
     ax_collect_display_job(src, 0, 1);
@@ -1222,6 +1251,115 @@ fail:
     return -1;
 }
 
+/* No encoded producer: serialize with display-only capture. Temporary VIN
+ * capture is fully stopped before dropping the lock; a new viewer can then
+ * bind normally, with no cleanup race against its capture generation. */
+static void ax_pump_snapshot(struct ax_source *src, uint64_t deadline,
+                             char *error, uint32_t error_cap)
+{
+    uint64_t encoded = atomic_load(&src->encoded_requested_ms);
+    if ((encoded && ax_now_ms() - encoded < 2000) ||
+        pthread_mutex_trylock(&src->lock) != 0)
+        return;
+    encoded = atomic_load(&src->encoded_requested_ms);
+    if ((encoded && ax_now_ms() - encoded < 2000) ||
+        !atomic_load(&src->snapshot_pending) || atomic_load(&src->interrupted)) {
+        pthread_mutex_unlock(&src->lock);
+        return;
+    }
+    int temporary = !src->streaming;
+    if (temporary) {
+        uint32_t w, h, fps;
+        if (ax_hdmi_mode(&w, &h, &fps) != 0 ||
+            ax_capture_start(src, w, h, error, error_cap) != 0) {
+            pthread_mutex_unlock(&src->lock);
+            return;
+        }
+        src->fps = fps;
+    }
+    do {
+        uint64_t now = ax_now_ms();
+        if (now >= deadline) break;
+        const uint8_t *frame;
+        uint32_t stride;
+        int rc = ax_grab_frame_budget(src, &frame, &stride, error, error_cap,
+                                      (uint32_t)(deadline - now));
+        if (rc == 0) {
+            ax_capture_snapshot(src, src->held_index, stride, src->width,
+                                 src->height, src->output_resolution,
+                                 atomic_load(&src->snapshot_generation));
+            ax_requeue(src);
+            break;
+        }
+        if (rc < 0) break;
+    } while (temporary && atomic_load(&src->snapshot_pending));
+    if (temporary) ax_capture_stop(src);
+    pthread_mutex_unlock(&src->lock);
+}
+
+static int32_t ax_source_snapshot(void *source,
+    const struct onekvm_video_snapshot_request_v1 *request,
+    uint8_t *data, uint64_t capacity,
+    struct onekvm_video_snapshot_result_v1 *result, char *error, uint32_t error_cap)
+{
+    struct ax_source *src = source;
+    if (!src || !request || request->struct_size < sizeof(*request) ||
+        !result || result->struct_size < sizeof(*result) || !data ||
+        capacity > SIZE_MAX || request->flags || request->width < 0 ||
+        request->height < 0 || !!request->width != !!request->height ||
+        request->width > 4096 || request->height > 2400 || (request->width & 1) ||
+        !isfinite(request->quality_factor) || request->quality_factor < 0 ||
+        request->quality_factor > 1 || request->timeout_ms > 1000) {
+        ax_err(error, error_cap, "invalid snapshot request");
+        return ONEKVM_VIDEO_RESOURCE_INVALID;
+    }
+    if (!capacity) return ONEKVM_VIDEO_RESOURCE_BUFFER_TOO_SMALL;
+    if (pthread_mutex_trylock(&src->snapshot_gate) != 0)
+        return ONEKVM_VIDEO_RESOURCE_BUSY;
+    uint64_t deadline = ax_now_ms() + (request->timeout_ms ? request->timeout_ms : 1000);
+    pthread_mutex_lock(&src->snapshot_lock);
+    src->snapshot_width = request->width; src->snapshot_height = request->height;
+    src->snapshot_status = -ETIMEDOUT;
+    src->snapshot_frame = (struct onekvm_v4l2_transform_frame){0};
+    atomic_fetch_add(&src->snapshot_generation, 1);
+    atomic_store(&src->snapshot_pending, 1);
+    while (atomic_load(&src->snapshot_pending) && !atomic_load(&src->interrupted)) {
+        uint64_t now = ax_now_ms();
+        if (now >= deadline) break;
+        pthread_mutex_unlock(&src->snapshot_lock);
+        ax_pump_snapshot(src, deadline, error, error_cap);
+        pthread_mutex_lock(&src->snapshot_lock);
+        now = ax_now_ms();
+        if (!atomic_load(&src->snapshot_pending) || now >= deadline) break;
+        uint64_t until = now + 10 < deadline ? now + 10 : deadline;
+        struct timespec ts = {.tv_sec = until / 1000, .tv_nsec = (until % 1000) * 1000000};
+        pthread_cond_timedwait(&src->snapshot_cv, &src->snapshot_lock, &ts);
+    }
+    /* Cancellation and conversion share this lock; the gate retains the
+     * TDP output until JPEG finishes and prevents a subsequent conversion. */
+    atomic_store(&src->snapshot_pending, 0);
+    int rc = src->snapshot_status;
+    struct onekvm_v4l2_transform_frame frame = src->snapshot_frame;
+    uint32_t w = src->snapshot_width, h = src->snapshot_height;
+    uint64_t pts = src->snapshot_pts;
+    src->snapshot_frame = (struct onekvm_v4l2_transform_frame){0};
+    pthread_mutex_unlock(&src->snapshot_lock);
+    size_t size = 0;
+    if (!rc) rc = ax_snapshot_jpeg(&src->snapshot_jpeg, frame.data, w, h, frame.stride,
+                                  request->quality_factor, data, (size_t)capacity, &size);
+    if (frame.data) ax_tdp_snapshot_release(&src->snapshot_hw);
+    pthread_mutex_unlock(&src->snapshot_gate);
+    if (rc) {
+        ax_err(error, error_cap, "snapshot unavailable");
+        if (rc == -ENOSPC) return ONEKVM_VIDEO_RESOURCE_BUFFER_TOO_SMALL;
+        if (rc == -ENOMEM) return ONEKVM_VIDEO_RESOURCE_NO_MEMORY;
+        if (rc == -ETIMEDOUT) return ONEKVM_VIDEO_RESOURCE_TIMEOUT;
+        return ONEKVM_VIDEO_RESOURCE_INTERNAL;
+    }
+    result->data_size = size; result->width = w; result->height = h; result->pts_ns = pts;
+    return ONEKVM_VIDEO_RESOURCE_OK;
+}
+
 static void ax_source_init(struct ax_source *src)
 {
     memset(src, 0, sizeof(*src));
@@ -1229,6 +1367,12 @@ static void ax_source_init(struct ax_source *src)
     src->wake_fd = -1;
     src->import_venc_fd = -1;
     ax_tdp_init(&src->display_hw);
+    ax_tdp_init(&src->snapshot_hw);
+    pthread_mutex_init(&src->snapshot_gate, NULL);
+    pthread_mutex_init(&src->snapshot_lock, NULL);
+    atomic_init(&src->snapshot_pending, 0);
+    atomic_init(&src->snapshot_generation, 0);
+    atomic_init(&src->encoded_requested_ms, 0);
     pthread_mutex_init(&src->lock, NULL);
     pthread_mutex_init(&src->display_lock, NULL);
     pthread_mutex_init(&src->display_job_lock, NULL);
@@ -1238,6 +1382,7 @@ static void ax_source_init(struct ax_source *src)
     pthread_condattr_init(&attr);
     pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
     pthread_cond_init(&src->display_cv, &attr);
+    pthread_cond_init(&src->snapshot_cv, &attr);
     pthread_condattr_destroy(&attr);
     atomic_init(&src->interrupted, 0);
     atomic_init(&src->display_requested_ms, 0);
@@ -1280,6 +1425,9 @@ fail:
         close(src->wake_fd);
     pthread_cond_destroy(&src->display_job_cv);
     pthread_mutex_destroy(&src->display_job_lock);
+    pthread_cond_destroy(&src->snapshot_cv);
+    pthread_mutex_destroy(&src->snapshot_lock);
+    pthread_mutex_destroy(&src->snapshot_gate);
     pthread_cond_destroy(&src->display_cv);
     pthread_mutex_destroy(&src->display_lock);
     pthread_mutex_destroy(&src->lock);
@@ -1302,6 +1450,7 @@ static int32_t ax_source_reset(void *source,
     snprintf(src->device, sizeof(src->device), "%s", config->device);
     src->output_resolution = config->resolution;
     atomic_store(&src->interrupted, 0);
+    atomic_store(&src->encoded_requested_ms, 0);
     pthread_mutex_unlock(&src->lock);
     return 0;
 }
@@ -1357,6 +1506,11 @@ static void ax_source_destroy(void *source)
     if (src->wake_fd >= 0)
         close(src->wake_fd);
     ax_tdp_close(&src->display_hw);
+    ax_tdp_close(&src->snapshot_hw);
+    ax_snapshot_jpeg_destroy(src->snapshot_jpeg);
+    pthread_cond_destroy(&src->snapshot_cv);
+    pthread_mutex_destroy(&src->snapshot_lock);
+    pthread_mutex_destroy(&src->snapshot_gate);
     pthread_cond_destroy(&src->display_cv);
     pthread_cond_destroy(&src->display_job_cv);
     pthread_mutex_destroy(&src->display_job_lock);
@@ -1392,11 +1546,6 @@ static int32_t ax_source_latency(void *source, struct onekvm_video_latency_v1 *l
 
 static void ax_encoder_close(struct ax_encoder *enc)
 {
-    if (enc->dma_slot >= 0) {
-        atomic_store(&enc->au[enc->dma_slot].busy, 0);
-        enc->dma_slot = -1;
-    }
-    ax_au_ring_free(enc);
     ax_encoder_release_framebuf(enc);
     if (enc->cmd && enc->cmd != MAP_FAILED)
         munmap(enc->cmd, enc->mem.cmd_total_size);
@@ -1407,9 +1556,6 @@ static void ax_encoder_close(struct ax_encoder *enc)
     if (enc->venc_fd >= 0)
         close(enc->venc_fd);
     enc->venc_fd = -1;
-    free(enc->packet);
-    enc->packet = NULL;
-    enc->packet_cap = 0;
     enc->packet_len = 0;
     enc->publish = NULL;
 }
@@ -1477,7 +1623,6 @@ static int32_t ax_encoder_create(const struct onekvm_video_encoder_config_v1 *co
         return -1;
     }
     enc->venc_fd = -1;
-    enc->dma_slot = -1;
     atomic_init(&enc->color_info, 0);
     enc->codec = config->codec == ONEKVM_VIDEO_CODEC_H265
         ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
@@ -1527,6 +1672,7 @@ static int32_t ax_encoder_reset(void *encoder,
     enc->codec = config->codec == ONEKVM_VIDEO_CODEC_H265
         ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;
     enc->force_idr = 1;
+    enc->pacer = (struct ax_pacer){0};
     atomic_store(&enc->color_info, 0);
     return 0;
 }
@@ -1602,7 +1748,6 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
                    &width, &height);
     ax_capture_stop(src);
     if (!enc->have_geom || enc->geom.w != width || enc->geom.h != height) {
-        ax_au_ring_free(enc);
         if (ax_encoder_alloc_framebuf(enc, width, height, error, error_cap) != 0) {
             pthread_mutex_unlock(&src->lock);
             return -1;
@@ -1623,12 +1768,12 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
     src->display_seq++;
     pthread_cond_broadcast(&src->display_cv);
     pthread_mutex_unlock(&src->display_lock);
-    ax_au_ring_alloc(enc);
     enc->bound = src;
     enc->placeholder = 1;
     enc->early_capture = 0;
     enc->early_frame_seen = 0;
     enc->last_placeholder_ms = 0;
+    enc->pacer = (struct ax_pacer){0};
     enc->seq = 0;
     enc->force_idr = 1;
     fprintf(stderr, "ax630c: no HDMI signal, encoding %ux%u placeholder\n",
@@ -1658,11 +1803,6 @@ static int ax_bind_capture_locked(struct ax_encoder *enc, struct ax_source *src,
     ax_output_size(src->output_resolution, src->width, src->height,
                    &output_w, &output_h);
     if (!enc->have_geom || enc->geom.w != output_w || enc->geom.h != output_h) {
-        if (enc->dma_slot >= 0) {
-            atomic_store(&enc->au[enc->dma_slot].busy, 0);
-            enc->dma_slot = -1;
-        }
-        ax_au_ring_free(enc);
         if (ax_encoder_alloc_framebuf(enc, output_w, output_h, error, error_cap) != 0) {
             ax_capture_stop(src);
             return -1;
@@ -1672,7 +1812,6 @@ static int ax_bind_capture_locked(struct ax_encoder *enc, struct ax_source *src,
      * read path copies the frame instead. */
     if (output_w == src->width && output_h == src->height)
         ax_import_capture(src, enc->venc_fd);
-    ax_au_ring_alloc(enc);
     enc->bound = src;
     enc->placeholder = 0;
     enc->early_capture = early;
@@ -1684,8 +1823,7 @@ static int ax_bind_capture_locked(struct ax_encoder *enc, struct ax_source *src,
     enc->bound_h = src->height;
     enc->seq = 0;
     enc->force_idr = 1;
-    if (fps)
-        enc->fps = fps;
+    enc->pacer = (struct ax_pacer){0};
     fprintf(stderr, "ax630c: HDMI %s %ux%u @ %u, capture %ux%u stride %u, output %ux%u\n",
             early ? "prearmed" : "locked", w, h, fps, src->width, src->height, src->bytesperline,
             output_w, output_h);
@@ -1771,8 +1909,6 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
     uint32_t gopn;
     int is_idr;
     int rc;
-    uint8_t *copy;
-    size_t bytes;
 
     if (!enc || !packet) {
         ax_err(error, error_cap, "encoder missing");
@@ -1783,13 +1919,16 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         ax_err(error, error_cap, "encoder is not bound to a video source");
         return -1;
     }
+    atomic_store(&src->encoded_requested_ms, ax_now_ms());
     if (enc->placeholder) {
         uint64_t now = ax_now_ms();
 
+        uint32_t placeholder_fps = enc->fps < 5 ? enc->fps : 5;
+        uint32_t interval_ms = 1000u / (placeholder_fps ? placeholder_fps : 5);
         if (enc->last_placeholder_ms &&
-            now - enc->last_placeholder_ms < AX_PLACEHOLDER_INTERVAL_MS) {
+            now - enc->last_placeholder_ms < interval_ms) {
             struct pollfd wake = { .fd = src->wake_fd, .events = POLLIN };
-            int remaining = (int)(AX_PLACEHOLDER_INTERVAL_MS -
+            int remaining = (int)(interval_ms -
                                   (now - enc->last_placeholder_ms));
 
             poll(&wake, src->wake_fd >= 0 ? 1 : 0, remaining);
@@ -1822,6 +1961,8 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         ax_err(error, error_cap, "capture is not streaming");
         return -1;
     }
+    if (ax_wait_encode_slot(enc, src, error, error_cap) != 0)
+        return -1;
     pthread_mutex_lock(&src->lock);
     rc = ax_grab_frame(src, &frame, &stride, error, error_cap);
     if (rc == 2 && src->width >= 64 && src->height >= 64) {
@@ -1863,10 +2004,13 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
             }
         }
     }
+    if (rc == 0)
+        rc = ax_latest_capture(src, &frame, error, error_cap);
     if (rc != 0) {
         pthread_mutex_unlock(&src->lock);
         return -1;
     }
+    ax_pacer_advance(&enc->pacer, ax_now_ns());
     ax_schedule_display(src, stride);
     if (enc->early_capture) {
         enc->early_frame_seen = 1;
@@ -1915,34 +2059,34 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         goto encoded;
     }
 
-    bytes = (size_t)src->sizeimage;
-    if (!bytes)
-        bytes = (size_t)stride * src->height;
-    if (src->held && bytes > src->map_len[src->held_index])
-        bytes = src->map_len[src->held_index];
-    copy = malloc(bytes);
-    if (!copy) {
+    /* Failed DMA import / padded capture stride: copy once into the fixed
+     * encoder input while VIN is held, then release VIN before hardware wait. */
+    size_t row = (size_t)enc->geom.w * 2;
+    size_t required = (size_t)(enc->geom.h - 1) * stride + row;
+    if (stride < row || !src->held || required > src->map_len[src->held_index]) {
         ax_requeue(src);
         pthread_mutex_unlock(&src->lock);
-        ax_err(error, error_cap, "out of memory");
+        ax_err(error, error_cap, "capture frame is too small");
         return -1;
     }
-    memcpy(copy, frame, bytes);
+    ax_copy_yuyv(enc->fb_map + enc->geom.off_in, enc->geom.w * 2, frame,
+                 stride, enc->geom.w, enc->geom.h);
     ax_requeue(src);
     pthread_mutex_unlock(&src->lock);
-    rc = ax_encode_yuyv(enc, copy, stride, 0, is_idr, gopn);
-    free(copy);
+    rc = ax_encode_yuyv(enc, NULL, enc->geom.w * 2,
+                         (uint32_t)enc->fb.bus_addr + enc->geom.off_in, is_idr, gopn);
     if (rc != 0) {
         ax_err(error, error_cap, "VC8000E encode failed");
         return -1;
     }
 encoded:
     enc->seq++;
-    packet->data = enc->publish ? enc->publish : enc->packet;
+    packet->data = enc->publish;
     packet->data_size = enc->packet_len;
     packet->codec = enc->codec;
     packet->key_frame = enc->packet_key;
     packet->pts_ns = enc->packet_pts;
+    ax_packet_duration(enc, src, packet);
     return 0;
 }
 
@@ -1956,6 +2100,7 @@ static int32_t ax_encoder_unbind_source(void *encoder, char *error, uint32_t err
         return -1;
     if (enc->bound) {
         pthread_mutex_lock(&enc->bound->lock);
+        atomic_store(&enc->bound->encoded_requested_ms, 0);
         ax_capture_stop(enc->bound);
         pthread_mutex_unlock(&enc->bound->lock);
         enc->bound = NULL;
@@ -1969,6 +2114,7 @@ static int32_t ax_encoder_unbind_source(void *encoder, char *error, uint32_t err
     enc->signal_loss_since_ms = 0;
     enc->last_mode_ms = 0;
     enc->last_placeholder_ms = 0;
+    enc->pacer = (struct ax_pacer){0};
     enc->seq = 0;
     enc->force_idr = 1;
     return 0;
@@ -2018,6 +2164,7 @@ static const struct onekvm_video_backend_v1 ax_backend = {
                 ONEKVM_VIDEO_FEATURE_EDID |
                 ONEKVM_VIDEO_FEATURE_BOUND_ENCODED_TIME |
                 ONEKVM_VIDEO_FEATURE_ENCODER_COLOR_INFO |
+                ONEKVM_VIDEO_FEATURE_SOURCE_SNAPSHOT |
                 ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY |
                 ONEKVM_VIDEO_FEATURE_SOURCE_DISPLAY_CACHE_ONLY,
     .formats = ax_formats,
@@ -2044,6 +2191,7 @@ static const struct onekvm_video_backend_v1 ax_backend = {
     .source_input_format = ax_source_input_format,
     .source_latency = ax_source_latency,
     .source_display = ax_source_display,
+    .source_snapshot = ax_source_snapshot,
     .encoder_latency = ax_encoder_latency,
     .edid_capabilities = ax_edid_capabilities,
     .edid_get = ax_edid_get,

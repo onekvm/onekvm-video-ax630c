@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -214,12 +215,122 @@ static int tag_rejection(void)
     return 0;
 }
 
+static int cm_batches(void)
+{
+    static const unsigned int lengths[] = {0,1,15,16,17,1199,1200,1201,32768,65504};
+    uint8_t key[36], input[65536], expected[65568], digest[20];
+    uint8_t (*output)[65568] = calloc(32, 65568);
+    struct onekvm_crypto_cm_request_v1 requests[32];
+    char error[256];
+    void *session = NULL;
+    uint32_t completed;
+
+    CHECK(output && api->cm_seal_batch);
+    CHECK(api->features & ONEKVM_CRYPTO_FEATURE_AES_CM_TX_BATCH);
+    CHECK(!(api->features & ONEKVM_CRYPTO_FEATURE_HMAC_SHA1));
+    for (unsigned int i = 0; i < sizeof(key); i++) key[i] = i * 7 + 5;
+    for (unsigned int i = 0; i < sizeof(input); i++) input[i] = i * 13 + 3;
+    CHECK(api->primitive_create(3, key, 35, &session, error, sizeof(error)) < 0 && !session);
+    CHECK(!api->primitive_create(3, key, 36, &session, error, sizeof(error)));
+    CHECK(!api->cm_seal_batch(session, NULL, 0, &completed, error, sizeof(error)) && !completed);
+    for (unsigned int iteration = 0; iteration < 2; iteration++) {
+        for (unsigned int i = 0; i < 32; i++) {
+            uint32_t header = i % 2 ? 28 : 12, length = lengths[i % 10];
+            memset(output[i], 0xa5, 65568);
+            memcpy(output[i] + 1, input, header + length);
+            requests[i] = (struct onekvm_crypto_cm_request_v1){
+                .struct_size = sizeof(requests[i]), .src_size = header + length,
+                .header_size = header, .roc = i % 2 ? 0x1234ffff : 0xffffffff,
+                .src_ptr = (uintptr_t)(i % 2 ? output[i] + 1 : input),
+                .dst_ptr = (uintptr_t)(output[i] + 1), .dst_capacity = 65566,
+                .tag_size = i % 2 ? 4 : 10,
+            };
+            memset(requests[i].iv, 0xff, 16);
+            requests[i].iv[0] = i + iteration;
+            requests[i].iv[15] = 0xfe; /* carries through the low 64 bits */
+        }
+        CHECK(!api->cm_seal_batch(session, requests, 32, &completed, error, sizeof(error)));
+        CHECK(completed == 32);
+        for (unsigned int i = 0; i < 32; i++) {
+            struct onekvm_crypto_cm_request_v1 *r = &requests[i];
+            unsigned int digest_size;
+            memcpy(expected, input, r->header_size);
+            CHECK(!reference(1, key, 16, r->iv, NULL, 0, input + r->header_size,
+                             r->src_size - r->header_size, expected + r->header_size));
+            expected[r->src_size] = r->roc >> 24;
+            expected[r->src_size + 1] = r->roc >> 16;
+            expected[r->src_size + 2] = r->roc >> 8;
+            expected[r->src_size + 3] = r->roc;
+            CHECK(HMAC(EVP_sha1(), key + 16, 20, expected, r->src_size + 4, digest, &digest_size));
+            CHECK(digest_size == 20 && r->output_size == r->src_size + r->tag_size);
+            CHECK(!memcmp(output[i] + 1, expected, r->src_size));
+            CHECK(!memcmp(output[i] + 1 + r->src_size, digest, r->tag_size));
+            CHECK(output[i][0] == 0xa5 && output[i][1 + r->output_size] == 0xa5);
+        }
+    }
+    /* Invalid metadata must leave the failed packet and suffix unpublished. */
+    requests[1].tag_size = 16;
+    requests[1].output_size = 0;
+    CHECK(api->cm_seal_batch(session, requests, 3, &completed, error, sizeof(error)) < 0);
+    CHECK(completed == 1 && !requests[1].output_size);
+    requests[0].header_size = requests[0].src_size + 1;
+    CHECK(api->cm_seal_batch(session, requests, 1, &completed, error, sizeof(error)) < 0 && !completed);
+    requests[0].header_size = 12;
+    requests[0].src_size = UINT32_MAX;
+    CHECK(api->cm_seal_batch(session, requests, 1, &completed, error, sizeof(error)) < 0 && !completed);
+    CHECK(api->cm_seal_batch(session, requests, 33, &completed, error, sizeof(error)) < 0 && !completed);
+    struct onekvm_crypto_primitive_request_v1 ctr = {.struct_size = sizeof(ctr), .iv_size = 16};
+    CHECK(api->primitive_run(session, &ctr, error, sizeof(error)) < 0);
+    api->session_destroy(session);
+    free(output);
+    return 0;
+}
+
+/* Host model additionally proves submission count and failure publication. */
+static int cm_submission_checks(void *library)
+{
+    unsigned int (*run_count)(void) = dlsym(library, "crypto_mock_run_count");
+    void (*fail_next)(void) = dlsym(library, "crypto_mock_fail_next");
+    if (!run_count || !fail_next) return 0;
+    uint8_t key[36] = {0}, src[1212] = {0}, dst[8][1222];
+    struct onekvm_crypto_cm_request_v1 requests[8];
+    void *session = NULL;
+    char error[128];
+    uint32_t completed;
+    CHECK(!api->primitive_create(3, key, 36, &session, error, sizeof(error)));
+    for (unsigned int i = 0; i < 8; i++) {
+        requests[i] = (struct onekvm_crypto_cm_request_v1){
+            .struct_size = sizeof(requests[i]), .src_ptr = (uintptr_t)src,
+            .dst_ptr = (uintptr_t)dst[i], .src_size = sizeof(src), .header_size = 12,
+            .dst_capacity = sizeof(dst[i]), .tag_size = 10,
+        };
+        requests[i].iv[13] = i;
+    }
+    unsigned int before = run_count();
+    CHECK(!api->cm_seal_batch(session, requests, 8, &completed, error, sizeof(error)));
+    CHECK(completed == 8 && run_count() == before + 1);
+    fail_next();
+    CHECK(api->cm_seal_batch(session, requests, 8, &completed, error, sizeof(error)) == -EIO);
+    CHECK(!completed);
+    for (unsigned int i = 0; i < 8; i++) CHECK(!requests[i].output_size);
+    CHECK(!api->cm_seal_batch(session, requests, 8, &completed, error, sizeof(error)));
+    CHECK(completed == 8); /* failed submission was not retried */
+    before = run_count();
+    for (unsigned int i = 0; i < 8; i++) requests[i].src_size = 12;
+    CHECK(!api->cm_seal_batch(session, requests, 8, &completed, error, sizeof(error)));
+    CHECK(completed == 8 && run_count() == before); /* header-only packets */
+    api->session_destroy(session);
+    return 0;
+}
+
 static void *concurrent(void *index)
 {
     unsigned int i;
     for (i = 0; i < 24; i++)
         if (vector_case(i % 2, 16, 1199 + ((uintptr_t)index + i) % 8, i % 27, i % 2, 0))
             return (void *)1;
+    if (cm_batches())
+        return (void *)1;
     return NULL;
 }
 
@@ -297,6 +408,8 @@ int main(int argc, char **argv)
     CHECK(!vector_case(1, 32, 65472, 0, 1, 1));
     CHECK(!mixed_batches(16));
     CHECK(!mixed_batches(32));
+    CHECK(!cm_batches());
+    CHECK(!cm_submission_checks(library));
     CHECK(!tag_rejection());
     /* musl's default pthread stack is smaller than these test vector buffers. */
     CHECK(!pthread_attr_init(&attributes));
@@ -304,7 +417,7 @@ int main(int argc, char **argv)
     for (i = 0; i < 4; i++) CHECK(!pthread_create(&threads[i], &attributes, concurrent, (void *)(uintptr_t)i));
     CHECK(!pthread_attr_destroy(&attributes));
     for (i = 0; i < 4; i++) { CHECK(!pthread_join(threads[i], &result)); CHECK(!result); }
-    puts("PASS: ABI, AES-CTR/GCM vectors, arbitrary lengths, AAD, in-place, counter carry, mixed 32-item batches, batch prefix, tag/AAD rejection, 4 concurrent sessions");
+    puts("PASS: ABI, AES-CTR/GCM/CM vectors, arbitrary lengths, AAD, in-place, counter carry, mixed 32-item batches, batch prefix, CM tags/ROC, tag/AAD rejection, 4 concurrent sessions");
     CHECK(!benchmark(1200)); CHECK(!benchmark(32768));
     dlclose(library);
     return 0;

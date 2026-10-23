@@ -34,6 +34,8 @@ int main(int argc, char **argv)
     library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!library)
         return fail("dlopen", dlerror());
+    if (dlsym(library, "onekvm_crypto_backend_query") != NULL)
+        return fail("crypto", "production backend must not expose hardware crypto");
     loaded.symbol = dlsym(library, ONEKVM_VIDEO_BACKEND_QUERY_SYMBOL);
     if (!loaded.fn)
         return fail("dlsym", dlerror());
@@ -60,6 +62,8 @@ int main(int argc, char **argv)
         !(api->features & ONEKVM_VIDEO_FEATURE_ENCODER_COLOR_INFO) ||
         !api->encoder_color_info)
         return fail("color info", "optional tail missing");
+    if (!(api->features & ONEKVM_VIDEO_FEATURE_SOURCE_SNAPSHOT) || !api->source_snapshot)
+        return fail("snapshot", "JPEG snapshot ABI missing");
     memset(&source_config, 0, sizeof(source_config));
     source_config.struct_size = sizeof(source_config);
     source_config.device = "/dev/null";
