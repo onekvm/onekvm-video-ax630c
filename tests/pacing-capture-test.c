@@ -61,6 +61,26 @@ int main(void)
     assert(!ax_pacer_deadline(&pacer, 30, 60));
     assert(ax_nominal_fps(59) == 60 && ax_nominal_fps(29) == 30);
     assert(ax_nominal_fps(24) == 24 && ax_nominal_fps(25) == 25);
+    /* Automatic must clear an existing manual deadline and publish native
+     * timing at both 120 Hz and 30 Hz, including no-signal cadence. */
+    assert(!ax_pacer_deadline(&pacer, 0, 120) && !pacer.fps);
+    assert(ax_effective_fps(0, 120) == 120);
+    assert(ax_effective_fps(0, 30) == 30);
+    assert(ax_effective_fps(0, 5) == 5);
+    assert(ax_effective_fps(30, 120) == 30);
+    struct onekvm_video_encoder_config_v1 config = {
+        .struct_size = sizeof(config), .codec = ONEKVM_VIDEO_CODEC_H264,
+        .quality_factor = 0.5, .fps = 60,
+    };
+    void *opaque = NULL;
+    char create_error[128];
+    assert(ax_encoder_create(&config, &opaque, create_error, sizeof(create_error)) == 0);
+    struct ax_encoder *automatic = opaque;
+    assert(automatic->fps == 60);
+    config.fps = 0;
+    assert(ax_encoder_reset(automatic, &config, create_error, sizeof(create_error)) == 0);
+    assert(automatic->fps == 0);
+    ax_encoder_destroy(automatic);
 
     struct ax_source src;
     ax_source_init(&src);

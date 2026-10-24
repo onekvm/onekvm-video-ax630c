@@ -20,6 +20,13 @@ static inline uint32_t ax_nominal_fps(uint32_t measured)
     return measured ? measured : 60;
 }
 
+/* Zero is automatic: use capture cadence without an extra software ceiling. */
+static inline uint32_t ax_effective_fps(uint32_t requested, uint32_t input)
+{
+    input = input ? input : 60;
+    return requested && requested < input ? requested : input;
+}
+
 /* Only pace below the input rate. Native-rate capture already provides its
  * own clock; adding a second clock there risks dropping alternating frames. */
 static inline uint64_t ax_pacer_deadline(struct ax_pacer *p, uint32_t requested,

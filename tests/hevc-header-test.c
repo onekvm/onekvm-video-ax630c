@@ -4,6 +4,7 @@
  * intentionally corrected to limited-range BT.709. H.264 signals the same
  * colour fields at HD and SD sizes, without changing its reorder bounds. */
 #include <stdio.h>
+#include <assert.h>
 #include <string.h>
 #include "vcenc_hevc_header.h"
 
@@ -19,6 +20,11 @@ static int cmp(const char *what, const uint8_t *got, int gn, const char *hex)
 int main(void)
 {
 	uint8_t b[256]; int fails = 0, n;
+
+	assert(vcenc_hevc_level_idc_fps(1920, 1080, 120) == 150);
+	assert(vcenc_hevc_level_idc_fps(3840, 2160, 30) == 150);
+	n = vcenc_write_sps_fps(b, 1920, 1080, 120);
+	assert(n > 8 && b[7] == 51); /* 1080p120 exceeds AVC level 4.2 MB/s. */
 	n = vcenc_write_vps(b, 153);
 	fails += cmp("VPS 1080p", b, n, "40010c01ffff014000000300800000030000030099ac09");
 	n = vcenc_write_hevc_sps(b, 1920, 1080, 153);

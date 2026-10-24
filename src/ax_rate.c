@@ -45,7 +45,7 @@ int ax_rate_configure(struct ax_rate *rate,
     next.initial_qp = vcenc_rc_clampu(c.initial_qp ? c.initial_qp : 32,
                                      next.min_qp, next.max_qp);
     next.bitrate_kbps = (uint32_t)c.bitrate_kbps;
-    next.fps = c.fps ? (uint32_t)c.fps : 60;
+    next.fps = (uint32_t)c.fps;
     *rate = next;
     return 0;
 }
@@ -72,7 +72,9 @@ uint32_t ax_rate_prepare(struct ax_rate *rate, struct vcenc_rc *next,
                          uint32_t input_fps, uint32_t gop, int idr)
 {
     struct vcenc_rc *rc = &rate->controller;
-    uint32_t fps = input_fps && input_fps < rate->fps ? input_fps : rate->fps;
+    uint32_t fps = rate->fps;
+    if (!fps || (input_fps && input_fps < fps)) fps = input_fps;
+    if (!fps) fps = 60;
     double target = (double)ax_rate_target_kbps(rate, w, h, fps) * 1000.0;
 
     if (!rate->ready || rc->codec != codec || rc->w != w || rc->h != h) {

@@ -875,11 +875,13 @@ static void ax_output_size(int32_t resolution, uint32_t input_w, uint32_t input_
 static uint32_t ax_write_parameter_sets(struct ax_encoder *enc, uint8_t *out)
 {
     uint32_t size;
+    uint32_t fps = ax_effective_fps(enc->fps, enc->placeholder ? 5 :
+                                   ax_nominal_fps(enc->bound ? enc->bound->fps : 60));
 
     if (enc->codec == ONEKVM_VIDEO_CODEC_H265)
-        return vcenc_write_hevc_headers(out, enc->geom.w, enc->geom.h, enc->rate.initial_qp,
-                                       vcenc_hevc_level_idc(enc->geom.w, enc->geom.h));
-    size = vcenc_write_sps(out, enc->geom.w, enc->geom.h);
+        return vcenc_write_hevc_headers_fps(out, enc->geom.w, enc->geom.h, enc->rate.initial_qp,
+                                           vcenc_hevc_level_idc_fps(enc->geom.w, enc->geom.h, fps), fps);
+    size = vcenc_write_sps_fps(out, enc->geom.w, enc->geom.h, fps);
     return size + vcenc_write_pps(out + size, enc->rate.initial_qp);
 }
 
@@ -1169,7 +1171,7 @@ static void ax_packet_duration(struct ax_encoder *enc, struct ax_source *src,
     if (packet->struct_size >= offsetof(struct onekvm_video_packet_v1, duration_ns) +
                                sizeof(packet->duration_ns)) {
         uint32_t input = enc->placeholder ? 5 : ax_nominal_fps(src->fps);
-        uint32_t fps = input < enc->fps ? input : enc->fps;
+        uint32_t fps = ax_effective_fps(enc->fps, input);
         packet->duration_ns = 1000000000ull / (fps ? fps : 60);
     }
 #else
@@ -1655,13 +1657,11 @@ static int32_t ax_encoder_create(const struct onekvm_video_encoder_config_v1 *co
     }
     enc->qp = enc->rate.initial_qp;
     enc->gop = 30;
-    enc->fps = 60;
+    enc->fps = (uint32_t)config->fps;
     if (config->struct_size >= offsetof(struct onekvm_video_encoder_config_v1, gop) +
                                    sizeof(int32_t) &&
         config->gop > 1)
         enc->gop = (uint32_t)config->gop;
-    if (config->fps > 0)
-        enc->fps = (uint32_t)config->fps;
     *encoder = enc;
     return 0;
 }
@@ -1688,8 +1688,7 @@ static int32_t ax_encoder_reset(void *encoder,
     }
     if (config->gop > 1)
         enc->gop = (uint32_t)config->gop;
-    if (config->fps > 0)
-        enc->fps = (uint32_t)config->fps;
+    enc->fps = (uint32_t)config->fps;
     enc->qp = enc->rate.initial_qp;
     enc->codec = config->codec == ONEKVM_VIDEO_CODEC_H265
         ? ONEKVM_VIDEO_CODEC_H265 : ONEKVM_VIDEO_CODEC_H264;

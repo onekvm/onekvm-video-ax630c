@@ -72,13 +72,13 @@ static uint32_t bw_finish(struct bitw *w, uint8_t *out)
 
 /* Annex-B SPS NAL (start code included) for a progressive 4:2:0 stream.
  * Returns bytes written. */
-static uint32_t vcenc_write_sps(uint8_t *out, uint32_t width, uint32_t height)
+static uint32_t vcenc_write_sps_fps(uint8_t *out, uint32_t width, uint32_t height, uint32_t fps)
 {
 	static const uint8_t sc[5] = { 0, 0, 0, 1, 0x67 };
 	uint32_t mbs_w = (width + 15) / 16, mbs_h = (height + 15) / 16;
 	uint32_t crop_r = (mbs_w * 16 - width) / 2;   /* 4:2:0 frame crop units */
 	uint32_t crop_b = (mbs_h * 16 - height) / 2;
-	/* smallest level fitting the MB count at 60 fps (table in vcenc_geom.h
+	/* smallest level fitting the MB count and output cadence (table in vcenc_geom.h
 	 * spirit; kept local so this header stays standalone) */
 	static const struct { uint32_t fs, mbps; uint8_t idc; } lvl[] = {
 		{ 1620,  40500, 30 }, { 1620, 108000, 31 }, { 3600, 216000, 32 },
@@ -87,7 +87,7 @@ static uint32_t vcenc_write_sps(uint8_t *out, uint32_t width, uint32_t height)
 	};
 	uint32_t fs = mbs_w * mbs_h, level = 51;
 	for (unsigned li = 0; li < sizeof lvl / sizeof lvl[0]; li++)
-		if (fs <= lvl[li].fs && fs * 60 <= lvl[li].mbps) {
+		if (fs <= lvl[li].fs && (uint64_t)fs * (fps ? fps : 60) <= lvl[li].mbps) {
 			level = lvl[li].idc;
 			break;
 		}
@@ -96,7 +96,7 @@ static uint32_t vcenc_write_sps(uint8_t *out, uint32_t width, uint32_t height)
 
 	bw_u(&w, 77, 8);        /* profile_idc: Main (CABAC, no High PPS ext) */
 	bw_u(&w, 0, 8);         /* constraint_set flags + reserved_zero */
-	bw_u(&w, level, 8);     /* level_idc from MB count @ 60 fps */
+	bw_u(&w, level, 8);     /* level_idc from MB count and frame rate */
 	bw_ue(&w, 0);           /* seq_parameter_set_id */
 	bw_ue(&w, 12);          /* log2_max_frame_num_minus4 -> 16 (pinned) */
 	bw_ue(&w, 0);           /* pic_order_cnt_type (pinned) */
@@ -149,6 +149,11 @@ static uint32_t vcenc_write_sps(uint8_t *out, uint32_t width, uint32_t height)
 
 /* Annex-B PPS NAL. pic_init_qp must equal the register program's sw7 QP
  * (the hardware writes slice_qp_delta = 0). */
+static inline uint32_t vcenc_write_sps(uint8_t *out, uint32_t width, uint32_t height)
+{
+    return vcenc_write_sps_fps(out, width, height, 60);
+}
+
 static uint32_t vcenc_write_pps(uint8_t *out, uint32_t pic_init_qp)
 {
 	static const uint8_t sc[5] = { 0, 0, 0, 1, 0x68 };

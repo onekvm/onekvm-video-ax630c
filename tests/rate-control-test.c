@@ -64,6 +64,13 @@ static void config_and_retarget(void)
     ax_rate_prepare(&rate, &next, 1, 1280, 720, 60, 30, 1);
     assert(next.frames == 0 && next.w == 1280 && next.h == 720);
 
+    c.fps = 0;
+    assert(ax_rate_configure(&rate, &c) == 0);
+    ax_rate_prepare(&rate, &next, 1, 1920, 1080, 120, 30, 1);
+    assert(next.fps == 120 && next.bitrate == 10000000);
+    ax_rate_prepare(&rate, &next, 1, 3840, 2160, 30, 30, 1);
+    assert(next.fps == 30 && next.bitrate == 10000000);
+
     c.bitrate_kbps = 2400;
     assert(ax_rate_configure(&rate, &c) == 0);
     ax_rate_set_quality(&rate, 0.01);

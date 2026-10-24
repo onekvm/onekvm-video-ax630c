@@ -16,7 +16,7 @@
  * off, deblocking control present with override off, parallel merge level 2.
  * pic_init_qp must equal the register program's frame QP (slice_qp_delta is
  * written as 0). VUI signals the captured limited-range BT.709 pixels,
- * matching H.264; timing remains 60 fps with mv lengths 10/8.
+ * matching H.264; timing follows the output cadence, with mv lengths 10/8.
  * Picture dimensions are min-CB (8) aligned with a conformance window
  * for the remainder, as the vendor does at 1366x768.
  *
@@ -51,8 +51,8 @@ static void hevc_ptl(struct bitw *w, uint32_t level_idc)
 }
 
 /* Smallest HEVC level whose MaxLumaPs and MaxLumaSr (Table A.8, Main tier)
- * hold the picture at 60 fps. level_idc = level * 30. */
-static inline uint32_t vcenc_hevc_level_idc(uint32_t w, uint32_t h)
+ * hold the picture at the output cadence. level_idc = level * 30. */
+static inline uint32_t vcenc_hevc_level_idc_fps(uint32_t w, uint32_t h, uint32_t fps)
 {
 	static const struct { uint32_t ps; uint64_t sr; uint32_t idc; } lvl[] = {
 		{ 2228224u,  133693440ull, 123 },   /* 4.1 */
@@ -62,9 +62,14 @@ static inline uint32_t vcenc_hevc_level_idc(uint32_t w, uint32_t h)
 	};
 	uint64_t ps = (uint64_t)w * h;
 	for (unsigned i = 0; i < sizeof lvl / sizeof lvl[0]; i++)
-		if (ps <= lvl[i].ps && ps * 60 <= lvl[i].sr)
+		if (ps <= lvl[i].ps && ps * (fps ? fps : 60) <= lvl[i].sr)
 			return lvl[i].idc;
 	return 156;
+}
+
+static inline uint32_t vcenc_hevc_level_idc(uint32_t w, uint32_t h)
+{
+    return vcenc_hevc_level_idc_fps(w, h, 60);
 }
 
 /* Annex-B VPS NAL (start code included). */
@@ -94,8 +99,8 @@ static uint32_t vcenc_write_vps(uint8_t *out, uint32_t level_idc)
 }
 
 /* Annex-B SPS NAL for a progressive 4:2:0 8-bit stream of WxH (even). */
-static uint32_t vcenc_write_hevc_sps(uint8_t *out, uint32_t width,
-				     uint32_t height, uint32_t level_idc)
+static uint32_t vcenc_write_hevc_sps_fps(uint8_t *out, uint32_t width,
+				     uint32_t height, uint32_t level_idc, uint32_t fps)
 {
 	static const uint8_t sc[6] = { 0, 0, 0, 1, 0x42, 0x01 }; /* nal 33 */
 	uint32_t w8 = (width + 7) & ~7u, h8 = (height + 7) & ~7u;
@@ -164,7 +169,7 @@ static uint32_t vcenc_write_hevc_sps(uint8_t *out, uint32_t width,
 	bw_u(&w, 0, 1);         /* default_display_window_flag */
 	bw_u(&w, 1, 1);         /* vui_timing_info_present_flag */
 	bw_u(&w, 1, 32);        /* vui_num_units_in_tick */
-	bw_u(&w, 60, 32);       /* vui_time_scale */
+	bw_u(&w, fps ? fps : 60, 32); /* vui_time_scale */
 	bw_u(&w, 0, 1);         /* vui_poc_proportional_to_timing_flag */
 	bw_u(&w, 0, 1);         /* vui_hrd_parameters_present_flag */
 	bw_u(&w, 1, 1);         /* bitstream_restriction_flag */
@@ -182,6 +187,12 @@ static uint32_t vcenc_write_hevc_sps(uint8_t *out, uint32_t width,
 }
 
 /* Annex-B PPS NAL. pic_init_qp must equal the register program's frame QP. */
+static inline uint32_t vcenc_write_hevc_sps(uint8_t *out, uint32_t width,
+                                      uint32_t height, uint32_t level_idc)
+{
+    return vcenc_write_hevc_sps_fps(out, width, height, level_idc, 60);
+}
+
 static uint32_t vcenc_write_hevc_pps(uint8_t *out, uint32_t pic_init_qp)
 {
 	static const uint8_t sc[6] = { 0, 0, 0, 1, 0x44, 0x01 }; /* nal 34 */
@@ -224,14 +235,21 @@ static uint32_t vcenc_write_hevc_pps(uint8_t *out, uint32_t pic_init_qp)
 }
 
 /* VPS+SPS+PPS for one IDR; returns bytes written (out >= 160 bytes). */
-static inline uint32_t vcenc_write_hevc_headers(uint8_t *out, uint32_t width,
+static inline uint32_t vcenc_write_hevc_headers_fps(uint8_t *out, uint32_t width,
 						uint32_t height, uint32_t qp,
-						uint32_t level_idc)
+						uint32_t level_idc, uint32_t fps)
 {
 	uint32_t n = vcenc_write_vps(out, level_idc);
-	n += vcenc_write_hevc_sps(out + n, width, height, level_idc);
+	n += vcenc_write_hevc_sps_fps(out + n, width, height, level_idc, fps);
 	n += vcenc_write_hevc_pps(out + n, qp);
 	return n;
+}
+
+static inline uint32_t vcenc_write_hevc_headers(uint8_t *out, uint32_t width,
+                                              uint32_t height, uint32_t qp,
+                                              uint32_t level_idc)
+{
+    return vcenc_write_hevc_headers_fps(out, width, height, qp, level_idc, 60);
 }
 
 #endif /* VCENC_HEVC_HEADER_H */
