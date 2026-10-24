@@ -59,7 +59,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 }
 int main(void)
 {
-    struct ax_encoder enc = {.venc_fd = 456, .gop = 30, .fps = 60, .seq = 1, .logged = 8};
+    struct ax_encoder enc = {.venc_fd = 456, .gop = 30, .fps = 60, .seq = 1};
     struct ax_source src; ax_source_init(&src); src.fps = 60;
     enc.bound = &src;
     assert(!vcenc_geom_build(&enc.geom, 1920, 1080));

@@ -163,7 +163,6 @@ struct ax_encoder {
     uint32_t packet_key;
     uint64_t packet_pts;
     uint64_t encode_ns;
-    unsigned logged;
     uint8_t *publish;
 };
 
@@ -978,17 +977,6 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
         uint32_t range = VCENC_VIDEO_FULL_RANGE
             ? ONEKVM_VIDEO_COLOR_RANGE_FULL : ONEKVM_VIDEO_COLOR_RANGE_LIMITED;
         atomic_store(&enc->color_info, VCENC_COMPONENT_BITS | (range << 8));
-    }
-    if (enc->logged < 8 || (enc->seq % 120u) == 0) {
-        fprintf(stderr,
-                "ax630c: frame %u %s %s %ux%u bytes=%zu cycles=%u qp=%u range=%u-%u target=%.0fkbps head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                enc->seq, hevc ? "H.265" : "H.264", is_idr ? "IDR" : "P", enc->geom.w, enc->geom.h,
-                enc->packet_len, swreg82, enc->qp, enc->rate.min_qp, enc->rate.max_qp,
-                enc->rate.controller.bitrate / 1000.0,
-                enc->publish[0], enc->publish[1], enc->publish[2], enc->publish[3],
-                enc->publish[4], enc->publish[5], enc->publish[6],
-                enc->packet_len > 7 ? enc->publish[7] : 0);
-        enc->logged++;
     }
     return 0;
 }
