@@ -10,7 +10,7 @@ LDFLAGS := -shared -pthread
 
 all: host
 
-host: build/ax630c.so build/abi-smoke build/no-signal-test build/display-test build/display-capture-test build/hevc-header-test build/edid-test build/rate-control-test build/vcenc-rc-test build/snapshot-test build/pacing-capture-test build/encoder-buffer-test build/snapshot-conversion-test build/tdp-cache-test build/capture-teardown-test
+host: build/ax630c.so build/abi-smoke build/no-signal-test build/display-test build/display-capture-test build/hevc-header-test build/edid-test build/rate-control-test build/vcenc-rc-test build/snapshot-test build/pacing-capture-test build/encoder-buffer-test build/snapshot-conversion-test build/tdp-cache-test build/input-format-test build/capture-teardown-test
 
 build:
 	mkdir -p build
@@ -66,6 +66,9 @@ build/encoder-buffer-test: tests/encoder-buffer-test.c src/ax630c_video.c src/ax
 build/tdp-cache-test: tests/tdp-cache-test.c src/ax_tdp.c src/ax_tdp.h | build
 	$(CC) $(CFLAGS) -o $@ tests/tdp-cache-test.c src/ax_tdp.c
 
+build/input-format-test: tests/input-format-test.c src/ax630c_video.c src/ax_pacing.h src/ax_snapshot.c src/ax_tdp.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c $(TRANSFORM) | build
+	$(CC) $(CFLAGS) -pthread -Wl,--wrap=fopen -Wl,--wrap=open -o $@ tests/input-format-test.c src/ax_snapshot.c src/ax_tdp.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c $(TRANSFORM) -lm $(JPEG_LIBS)
+
 build/capture-teardown-test: tests/capture-teardown-test.c src/ax630c_video.c src/ax_pacing.h src/ax_snapshot.c src/ax_tdp.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c $(TRANSFORM) | build
 	$(CC) $(CFLAGS) -pthread -Wl,--wrap=onekvm_v4l2_transform_destroy -Wl,--wrap=ioctl -Wl,--wrap=close -o $@ tests/capture-teardown-test.c src/ax_snapshot.c src/ax_tdp.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c $(TRANSFORM) -lm $(JPEG_LIBS)
 
@@ -86,6 +89,7 @@ build/hevc-header-test: tests/hevc-header-test.c third_party/vcenc-ewl/vcenc_hev
 
 smoke: host
 	./build/abi-smoke ./build/ax630c.so
+	./build/input-format-test
 	./build/capture-teardown-test
 	./build/no-signal-test
 	./build/display-test

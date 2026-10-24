@@ -119,6 +119,10 @@ struct ax_source {
     uint32_t bytesperline;
     uint32_t sizeimage;
     uint32_t fps;
+    /* HDMI metadata remains live while VIN is stopped. Size queries must not
+     * wait for capture/display or reopen the capture device. */
+    atomic_uint_fast64_t input_geometry;
+    atomic_uint input_fps;
     int32_t output_resolution;
     int streaming;
     int held;
@@ -264,6 +268,14 @@ static int ax_hdmi_mode(uint32_t *w, uint32_t *h, uint32_t *fps)
      * this provisional rate with the measured value. */
     *fps = rate ? rate : 60;
     return 0;
+}
+
+static void ax_publish_input_mode(struct ax_source *src,
+                                  uint32_t w, uint32_t h, uint32_t fps)
+{
+    atomic_store_explicit(&src->input_fps, fps, memory_order_relaxed);
+    atomic_store_explicit(&src->input_geometry, ((uint64_t)w << 32) | h,
+                          memory_order_release);
 }
 
 /* RX timing precedes CSI pixels. Only the stalled capture path reads it. */
@@ -1367,6 +1379,8 @@ static void ax_source_init(struct ax_source *src)
     atomic_init(&src->snapshot_pending, 0);
     atomic_init(&src->snapshot_generation, 0);
     atomic_init(&src->encoded_requested_ms, 0);
+    atomic_init(&src->input_geometry, 0);
+    atomic_init(&src->input_fps, 0);
     pthread_mutex_init(&src->lock, NULL);
     pthread_mutex_init(&src->display_lock, NULL);
     pthread_mutex_init(&src->display_job_lock, NULL);
@@ -1401,6 +1415,9 @@ static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *conf
     ax_source_init(src);
     snprintf(src->device, sizeof(src->device), "%s", config->device);
     src->output_resolution = config->resolution;
+    uint32_t w, h, fps;
+    if (ax_hdmi_mode(&w, &h, &fps) == 0)
+        ax_publish_input_mode(src, w, h, fps);
     src->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (src->wake_fd < 0) {
         ax_err_errno(error, error_cap, "eventfd");
@@ -1466,10 +1483,15 @@ static void ax_source_release(void *source, uint64_t token)
 
 static int32_t ax_source_signal_present(void *source)
 {
+    struct ax_source *src = source;
     uint32_t w, h, fps;
 
-    (void)source;
-    return ax_hdmi_mode(&w, &h, &fps) == 0 ? 1 : 0;
+    if (!src || ax_hdmi_mode(&w, &h, &fps) != 0)
+        return 0;
+    /* Core polls signal state even without video consumers. Publish that
+     * already-read bridge mode instead of leaving the last VIN size stale. */
+    ax_publish_input_mode(src, w, h, fps);
+    return 1;
 }
 
 static void ax_source_interrupt(void *source)
@@ -1516,14 +1538,20 @@ static void ax_source_destroy(void *source)
 static int32_t ax_source_input_format(void *source, struct onekvm_video_format_v1 *format)
 {
     struct ax_source *src = source;
+    uint64_t geometry;
 
-    if (!src || !format)
+    if (!src || !format || format->struct_size < ONEKVM_VIDEO_FORMAT_V1_BASE_SIZE)
         return -1;
-    format->width = (int32_t)src->width;
-    format->height = (int32_t)src->height;
-    format->fps = (int32_t)(src->fps ? src->fps : 0);
+    geometry = atomic_load_explicit(&src->input_geometry, memory_order_acquire);
+    if (!geometry)
+        return -1;
+    format->width = (int32_t)(geometry >> 32);
+    format->height = (int32_t)(uint32_t)geometry;
+    format->fps = (int32_t)atomic_load_explicit(&src->input_fps, memory_order_relaxed);
     format->pixel_format = ONEKVM_VIDEO_PIXEL_UNKNOWN;
-    format->flags = 0;
+    if (format->struct_size >= offsetof(struct onekvm_video_format_v1, flags) +
+                                   sizeof(format->flags))
+        format->flags = 0;
     return 0;
 }
 
@@ -1854,6 +1882,7 @@ static int32_t ax_encoder_bind_source(void *encoder, void *source,
         return ax_enter_placeholder(enc, src, error, error_cap);
     }
     enc->signal_loss_since_ms = 0;
+    ax_publish_input_mode(src, w, h, fps);
     pthread_mutex_lock(&src->lock);
     if (enc->early_capture &&
         (w != src->width || h != src->height) &&
