@@ -632,6 +632,12 @@ static void ax_release_imports(struct ax_source *src);
 static void ax_capture_stop(struct ax_source *src)
 {
     ax_collect_display_job(src, 1, 0);
+    /* Transform queues cache DMA-BUF imports beyond the last conversion.
+     * Release every VIN borrower before freeing/reallocating its pool: an
+     * old 4K pool pinned by previews can otherwise prevent even 1080p REQBUFS.
+     * Also run after a failed capture open, when cap_fd is already -1. */
+    ax_tdp_close(&src->display_hw);
+    ax_tdp_close(&src->snapshot_hw);
     pthread_mutex_lock(&src->display_lock);
     src->display_placeholder = 0;
     pthread_mutex_unlock(&src->display_lock);
