@@ -119,7 +119,11 @@ int main(void)
     assert(ax_edid_capabilities(&caps) == 0);
     assert(caps.min_bytes == 256 && caps.max_bytes == 256);
     assert(caps.flags == (ONEKVM_VIDEO_EDID_CAP_WRITABLE |
-                         ONEKVM_VIDEO_EDID_CAP_PERSISTENT | ONEKVM_VIDEO_EDID_CAP_HOTPLUG));
+                         ONEKVM_VIDEO_EDID_CAP_PERSISTENT | ONEKVM_VIDEO_EDID_CAP_HOTPLUG
+#ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
+                         | ONEKVM_VIDEO_EDID_CAP_TEMPORARY
+#endif
+                         ));
     assert(caps.apply_policy == ONEKVM_VIDEO_EDID_APPLY_HOTPLUG);
     assert(!strcmp(caps.chip_id, "LT6911UXC") && !strcmp(caps.board_id, "pro"));
     assert(opens == 2);
@@ -236,6 +240,23 @@ int main(void)
     assert(!memcmp(programmed, snapshot, 256));
     blob.data[12]--; blob.data[127]++;
     publish_error = 0;
+#ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
+    caps.struct_size = sizeof(caps);
+    int old_stages = stages, old_publications = publications;
+    before = writes;
+    assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_TEMPORARY, &apply, error, sizeof(error)) == 0);
+    assert(writes == before + 1 && stages == old_stages && publications == old_publications && !paused);
+    assert(apply.apply_required == ONEKVM_VIDEO_EDID_APPLY_HOTPLUG);
+    for (unsigned chip = 0; chip < 2; chip++) {
+        chip_id = chip ? "lt6911c\n" : "lt6911d\n";
+        before = writes;
+        assert(ax_edid_capabilities(&caps) == 0 && !(caps.flags & ONEKVM_VIDEO_EDID_CAP_TEMPORARY));
+        assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_TEMPORARY, &apply, error, sizeof(error)) != 0);
+        assert(writes == before && stages == old_stages && !paused);
+    }
+    chip_id = "lt6911uxc\n";
+    assert(ax_edid_set_mode(&blob, 99, &apply, error, sizeof(error)) != 0 && writes == before);
+#endif
     assert(ax_edid_get(NULL, error, sizeof(error)) != 0);
     assert(ax_edid_set(NULL, &apply, error, sizeof(error)) != 0);
     assert(ax_edid_set(&blob, NULL, error, sizeof(error)) != 0);

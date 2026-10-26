@@ -121,6 +121,10 @@ int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
         if (access(!strcmp(caps->chip_id, "LT6911UXC") ? EDID_SHADOW : EDID_DEVICE, W_OK) == 0)
             caps->flags |= ONEKVM_VIDEO_EDID_CAP_WRITABLE;
         caps->apply_policy = ONEKVM_VIDEO_EDID_APPLY_HOTPLUG;
+#ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
+        if (!strcmp(caps->chip_id, "LT6911UXC"))
+            caps->flags |= ONEKVM_VIDEO_EDID_CAP_TEMPORARY;
+#endif
     }
     caps->min_bytes = caps->max_bytes = EDID_BYTES;
     caps->board_id = "pro";
@@ -141,9 +145,9 @@ int32_t ax_edid_get(struct onekvm_video_edid_blob_v1 *edid,
     return 0;
 }
 
-int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
+static int32_t ax_edid_set_impl(const struct onekvm_video_edid_blob_v1 *edid,
                     struct onekvm_video_edid_apply_result_v1 *apply,
-                    char *error, uint32_t capacity)
+                    char *error, uint32_t capacity, int temporary)
 {
     if (!edid || !apply || edid->struct_size < sizeof(*edid) ||
         apply->struct_size < sizeof(*apply))
@@ -152,6 +156,8 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
         return edid_error(error, capacity, "EDID must contain two valid 128-byte blocks");
     const char *chip = bridge_chip();
     const int shadow = !strcmp(chip, "LT6911UXC");
+    if (temporary && !shadow)
+        return edid_error(error, capacity, "temporary EDID requires a UXC Shadow interface");
     if (!bridge_flash_supported(chip))
         return edid_error(error, capacity, "HDMI bridge EDID interface is unavailable");
     pthread_mutex_lock(&edid_update_lock);
@@ -164,11 +170,13 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
             failure = "current Shadow EDID is unavailable";
             goto out;
         }
-        if (ax_edid_storage_prepare(&storage, EDID_STATE_DIR, edid->data)) {
-            failure = "stage persistent EDID preference failed";
-            goto out;
+        if (!temporary) {
+            if (ax_edid_storage_prepare(&storage, EDID_STATE_DIR, edid->data)) {
+                failure = "stage persistent EDID preference failed";
+                goto out;
+            }
+            prepared = 1;
         }
-        prepared = 1;
     }
     if (ax_edid_capture_begin(error, capacity)) {
         failure = NULL;
@@ -182,9 +190,10 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
         written = write(fd, edid->data, EDID_BYTES);
     } while (written < 0 && errno == EINTR);
     int closed = close(fd);
-    if (written == EDID_BYTES && shadow && (closed || ax_edid_storage_publish(&storage))) {
-        /* Both the old preference and new preference were staged before
-         * touching RAM. Roll back RAM and disk if publication fails. */
+    if (written == EDID_BYTES && shadow &&
+        (closed || (!temporary && ax_edid_storage_publish(&storage)))) {
+        /* Close or preference publication failed after a verified RAM write.
+         * Persistent mode also staged both preference files before I2C. */
         int rollback_fd = open(EDID_SHADOW, O_WRONLY | O_CLOEXEC);
         ssize_t restored = -1;
         if (rollback_fd >= 0) {
@@ -193,8 +202,12 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
             } while (restored < 0 && errno == EINTR);
             if (close(rollback_fd)) restored = -1;
         }
-        failure = restored == EDID_BYTES ? "persist EDID preference failed; RAM restored" :
-                                          "persist EDID preference and RAM rollback failed";
+        if (temporary)
+            failure = restored == EDID_BYTES ? "close Shadow EDID failed; RAM restored" :
+                                              "close Shadow EDID and RAM rollback failed";
+        else
+            failure = restored == EDID_BYTES ? "persist EDID preference failed; RAM restored" :
+                                              "persist EDID preference and RAM rollback failed";
         written = -1;
     }
     if (written != EDID_BYTES || closed) goto out;
@@ -210,3 +223,26 @@ out:
     if (result && failure) return edid_error(error, capacity, failure);
     return result;
 }
+
+int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
+                    struct onekvm_video_edid_apply_result_v1 *apply,
+                    char *error, uint32_t capacity)
+{
+    return ax_edid_set_impl(edid, apply, error, capacity, 0);
+}
+
+#ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
+/* The optional shared ABI is supplied by Core. Older headers retain the
+ * permanent API without advertising a callback that they cannot describe. */
+int32_t ax_edid_set_mode(const struct onekvm_video_edid_blob_v1 *edid,
+                         uint32_t mode,
+                         struct onekvm_video_edid_apply_result_v1 *apply,
+                         char *error, uint32_t capacity)
+{
+    if (mode != ONEKVM_VIDEO_EDID_WRITE_PERMANENT &&
+        mode != ONEKVM_VIDEO_EDID_WRITE_TEMPORARY)
+        return edid_error(error, capacity, "unknown EDID write mode");
+    return ax_edid_set_impl(edid, apply, error, capacity,
+                           mode == ONEKVM_VIDEO_EDID_WRITE_TEMPORARY);
+}
+#endif

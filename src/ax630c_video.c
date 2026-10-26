@@ -2282,6 +2282,9 @@ static const struct onekvm_video_backend_v1 ax_backend = {
     .edid_get = ax_edid_get,
     .edid_set = ax_edid_set,
     .encoder_color_info = ax_encoder_color_info,
+#ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
+    .edid_set_mode = ax_edid_set_mode,
+#endif
 };
 
 ONEKVM_VIDEO_EXPORT int32_t onekvm_video_backend_query(uint32_t requested_abi,
