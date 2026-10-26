@@ -40,6 +40,13 @@ static const char *bridge_chip(void)
 
 static int bridge_flash_supported(const char *chip)
 {
+    if (!strcmp(chip, "LT6911C")) {
+        /* C firmware layouts vary. Only advertise a candidate whose EDID
+         * was validated by the driver. This reads RAM, never live flash;
+         * the driver checks the complete erase envelope again on writes. */
+        struct onekvm_video_edid_blob_v1 cached = {.struct_size = sizeof(cached)};
+        return ax_edid_get(&cached, NULL, 0) == 0;
+    }
     return !strcmp(chip, "LT6911UXC") || !strcmp(chip, "LT6911D");
 }
 
@@ -124,8 +131,8 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
     int fd = open(EDID_DEVICE, O_WRONLY | O_CLOEXEC);
     if (fd < 0)
         return edid_error(error, capacity, "open HDMI EDID for writing");
-    /* One complete write: the driver preserves the firmware version, writes
-     * flash, verifies readback and cycles the bridge to advertise the EDID. */
+    /* One complete write: the driver preserves the chip's surrounding
+     * metadata, verifies readback and cycles the bridge to advertise EDID. */
     ssize_t written;
     do {
         written = write(fd, edid->data, EDID_BYTES);
