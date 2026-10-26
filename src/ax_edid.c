@@ -10,6 +10,38 @@
 #define EDID_BYTES 256u
 #define EDID_DEVICE "/proc/lt6911_info/edid"
 #define EDID_SNAPSHOT "/proc/lt6911_info/edid_snapshot"
+#define CHIP_ID_DEVICE "/proc/lt6911_info/chip_id"
+
+/* The driver serves the detected ID from memory; this never probes I2C. */
+static const char *bridge_chip(void)
+{
+    char id[16];
+    size_t size = 0;
+    int fd = open(CHIP_ID_DEVICE, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return "LT6911";
+    while (size < sizeof(id) - 1) {
+        ssize_t n = read(fd, id + size, sizeof(id) - 1 - size);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0) { size = 0; break; }
+        if (n == 0)
+            break;
+        size += (size_t)n;
+    }
+    close(fd);
+    id[size] = '\0';
+    id[strcspn(id, "\r\n")] = '\0';
+    if (!strcmp(id, "lt6911uxc")) return "LT6911UXC";
+    if (!strcmp(id, "lt6911d")) return "LT6911D";
+    if (!strcmp(id, "lt6911c")) return "LT6911C";
+    return "LT6911";
+}
+
+static int bridge_flash_supported(const char *chip)
+{
+    return !strcmp(chip, "LT6911UXC") || !strcmp(chip, "LT6911D");
+}
 
 static int edid_error(char *error, uint32_t capacity, const char *message)
 {
@@ -37,12 +69,16 @@ int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
 {
     if (!caps || caps->struct_size < sizeof(*caps))
         return -1;
-    caps->flags = ONEKVM_VIDEO_EDID_CAP_PERSISTENT | ONEKVM_VIDEO_EDID_CAP_HOTPLUG;
-    if (access(EDID_DEVICE, W_OK) == 0)
-        caps->flags |= ONEKVM_VIDEO_EDID_CAP_WRITABLE;
+    caps->chip_id = bridge_chip();
+    caps->flags = 0;
+    caps->apply_policy = ONEKVM_VIDEO_EDID_APPLY_NONE;
+    if (bridge_flash_supported(caps->chip_id)) {
+        caps->flags = ONEKVM_VIDEO_EDID_CAP_PERSISTENT | ONEKVM_VIDEO_EDID_CAP_HOTPLUG;
+        if (access(EDID_DEVICE, W_OK) == 0)
+            caps->flags |= ONEKVM_VIDEO_EDID_CAP_WRITABLE;
+        caps->apply_policy = ONEKVM_VIDEO_EDID_APPLY_HOTPLUG;
+    }
     caps->min_bytes = caps->max_bytes = EDID_BYTES;
-    caps->apply_policy = ONEKVM_VIDEO_EDID_APPLY_HOTPLUG;
-    caps->chip_id = "LT6911UXC";
     caps->board_id = "pro";
     return 0;
 }
@@ -83,6 +119,8 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
         return edid_error(error, capacity, "invalid EDID request");
     if (!valid_edid(edid->data, edid->size))
         return edid_error(error, capacity, "EDID must contain two valid 128-byte blocks");
+    if (!bridge_flash_supported(bridge_chip()))
+        return edid_error(error, capacity, "HDMI bridge does not support EDID flash writing");
     int fd = open(EDID_DEVICE, O_WRONLY | O_CLOEXEC);
     if (fd < 0)
         return edid_error(error, capacity, "open HDMI EDID for writing");

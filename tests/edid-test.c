@@ -11,6 +11,9 @@
 static uint8_t snapshot[256], programmed[256];
 static size_t offset, available = sizeof(snapshot);
 static int writable = 1, missing, interrupted, write_error, short_write, writes, opens;
+static const char *chip_id = "lt6911uxc\n";
+static size_t chip_offset;
+static int chip_missing, chip_read_error;
 
 int __wrap_access(const char *path, int mode)
 {
@@ -21,6 +24,12 @@ int __wrap_access(const char *path, int mode)
 int __wrap_open(const char *path, int flags, ...)
 {
     opens++;
+    if (!strcmp(path, "/proc/lt6911_info/chip_id")) {
+        assert(flags == (O_RDONLY | O_CLOEXEC));
+        if (chip_missing) { errno = ENOENT; return -1; }
+        chip_offset = 0;
+        return 700;
+    }
     if (flags == (O_RDONLY | O_CLOEXEC)) {
         /* Never read the live flash interface: it resets HDMI. */
         assert(!strcmp(path, "/proc/lt6911_info/edid_snapshot"));
@@ -36,6 +45,16 @@ int __wrap_open(const char *path, int flags, ...)
 
 ssize_t __wrap_read(int fd, void *data, size_t size)
 {
+    if (fd == 700) {
+        if (chip_read_error) { errno = EIO; return -1; }
+        if (interrupted) { interrupted = 0; errno = EINTR; return -1; }
+        if (size > 3) size = 3;
+        if (size > strlen(chip_id) - chip_offset)
+            size = strlen(chip_id) - chip_offset;
+        memcpy(data, chip_id + chip_offset, size);
+        chip_offset += size;
+        return size;
+    }
     assert(fd == 701);
     if (interrupted) { interrupted = 0; errno = EINTR; return -1; }
     if (size > 17) size = 17;
@@ -58,7 +77,7 @@ ssize_t __wrap_write(int fd, const void *data, size_t size)
 
 int __wrap_close(int fd)
 {
-    assert(fd == 701 || fd == 702);
+    assert(fd == 700 || fd == 701 || fd == 702);
     return 0;
 }
 
@@ -78,7 +97,24 @@ int main(void)
                          ONEKVM_VIDEO_EDID_CAP_PERSISTENT | ONEKVM_VIDEO_EDID_CAP_HOTPLUG));
     assert(caps.apply_policy == ONEKVM_VIDEO_EDID_APPLY_HOTPLUG);
     assert(!strcmp(caps.chip_id, "LT6911UXC") && !strcmp(caps.board_id, "pro"));
-    assert(opens == 0);
+    assert(opens == 1);
+    chip_id = "lt6911d\n";
+    interrupted = 1;
+    assert(ax_edid_capabilities(&caps) == 0 && !strcmp(caps.chip_id, "LT6911D"));
+    assert(caps.flags & ONEKVM_VIDEO_EDID_CAP_WRITABLE);
+    chip_id = "lt6911c\n";
+    assert(ax_edid_capabilities(&caps) == 0 && !strcmp(caps.chip_id, "LT6911C"));
+    assert(caps.flags == 0 && caps.apply_policy == ONEKVM_VIDEO_EDID_APPLY_NONE);
+    chip_id = "unknown\n";
+    assert(ax_edid_capabilities(&caps) == 0 && !strcmp(caps.chip_id, "LT6911"));
+    assert(caps.flags == 0);
+    chip_missing = 1;
+    assert(ax_edid_capabilities(&caps) == 0 && caps.flags == 0);
+    chip_missing = 0;
+    chip_read_error = 1;
+    assert(ax_edid_capabilities(&caps) == 0 && caps.flags == 0);
+    chip_read_error = 0;
+    chip_id = "lt6911uxc\n";
     writable = 0;
     assert(ax_edid_capabilities(&caps) == 0 && !(caps.flags & ONEKVM_VIDEO_EDID_CAP_WRITABLE));
     writable = 1;
@@ -114,8 +150,13 @@ int main(void)
     writable = 0;
     assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == 0);
     writable = 1;
+    chip_id = "lt6911c\n";
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == 0);
+    chip_id = "unknown\n";
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == 0);
+    chip_id = "lt6911d\n";
     interrupted = 1;
-    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) == 0 && writes == 2);
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) == 0 && writes == 1);
     assert(!memcmp(programmed, snapshot, 256));
     assert(apply.apply_required == ONEKVM_VIDEO_EDID_APPLY_HOTPLUG);
     write_error = 1;

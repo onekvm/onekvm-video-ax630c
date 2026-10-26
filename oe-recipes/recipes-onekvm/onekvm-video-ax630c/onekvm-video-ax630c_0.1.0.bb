@@ -1,7 +1,7 @@
 SUMMARY = "AX630C native HDMI capture and VC8000E video backend"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
-PR = "r7"
+PR = "r8"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
 COMPATIBLE_MACHINE = "^onekvm-nanokvm-pro$"
@@ -11,10 +11,10 @@ inherit systemd pkgconfig
 SYSTEMD_SERVICE:${PN} = "onekvm-vdec.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
-# This source currently lives in the local Pro development tree. The ignored
-# kas externalsrc overlay selects it; the published recipe will pin a Git
-# revision once the AX630C backend becomes a standalone repository.
-S = "/sources/onekvm-video-ax630c"
+ONEKVM_COMPONENT_GIT_URI ??= "git://github.com/onekvm/onekvm-video-ax630c.git;protocol=https;branch=main"
+ONEKVM_COMPONENT_SRCREV ??= ""
+SRC_URI = "${ONEKVM_COMPONENT_GIT_URI}"
+SRCREV = "${ONEKVM_COMPONENT_SRCREV}"
 B = "${WORKDIR}/build"
 
 # Import the owned kernel UAPI, including it in the task signature even when

@@ -6,7 +6,10 @@ JPEG_LIBS ?= -ljpeg
 CFLAGS := -O2 -fPIC -Wall -Wextra -Wno-unused-parameter -fvisibility=hidden $(INC) $(JPEG_CFLAGS)
 LDFLAGS := -shared -pthread
 
-.PHONY: all host smoke clean
+.PHONY: all host smoke clean test-lt6911
+
+test-lt6911:
+	python3 tests/lt6911-register-test.py
 
 all: host
 

@@ -2,6 +2,31 @@
 
 `ax630c.so` 从 `open_vin_capture` 读取 YUYV，优先把已出队的 capture DMA 缓冲区导入 VC8000E；导入失败才复制到编码器帧缓冲。Core 使用绑定编码器接口读取 H.264 或 H.265 AU。
 
+## LT6911 型号与诊断
+
+Pro 的 `lt6911` 内核驱动通过实际寄存器 ID 区分芯片，旧
+`lontium,lt6911uxc` 设备树绑定和 `CONFIG_LT6911UXC` 配置继续兼容；
+新模块名为 `lt6911.ko`，配置为 `CONFIG_LT6911`，运行时驱动名仍为
+`lt6911-manage`。不能由 Pro/Desk 板型推断采集桥片一定为 UXC。
+
+| 型号 | ID 页与值 | 状态／时序 | EDID／板型字符串 |
+| --- | --- | --- | --- |
+| UXC | 81:00–02 = 17 04 83 | 保留既有实现 | 保留既有 Flash 操作 |
+| C | A0:00–01 = 16 05 | D2 测量、C2 CSI 尺寸、D1 采样率 | SDK 未实现，拒绝 Flash 操作 |
+| D | E0:80–83 = 25 10 23 01 | E0 尺寸、总时序、半像素时钟及采样率 | 独立 E0/E1 Flash 序列，保留并校验板型字符串 |
+
+移植依据是 Sipeed SDK `lt6911_manage.c/.h` v0.0.32，固定版本
+[`fd3114bfd3f984b5570fa8a5a564f1770cb8f751`](https://github.com/sipeed/maix_ax620e_sdk_kernel/tree/fd3114bfd3f984b5570fa8a5a564f1770cb8f751/linux/linux-4.19.125/drivers/misc)。
+C 在该 SDK 中没有帧率测量实现，驱动报告 0，后端沿用暂定 60 FPS；
+这不表示已测得真实输入帧率。C/D 缺少可靠的 HDCP 检测时报告 unknown。
+UXC、C、D 分开处理寄存器和中断极性，未知 ID 不得放行或执行 Flash 操作。
+
+`/proc/lt6911_info/chip_id` 返回实际探测型号；EDID ABI 同样读取这一缓存，
+不硬编码 UXC。机型初始化将 `/run/onekvm/lt6911_info` 链接到该目录，
+与 SG2002 的只读诊断缓存使用同一查询路径。驱动探测失败时 `/proc` 目录
+不存在，ADB 本身不隐藏该接口。C 的默认 EDID 初始化跳过不支持的写入，
+不会因此阻止 Core 启动；缺少驱动接口及未知芯片仍应明确报错。
+
 ## 编码格式
 
 后端 ABI 和设备描述同时声明 `auto`、`h264`、`h265`。后端独立打开 `auto` 时选择 H.264；网页在自动模式建立连接时提交浏览器已验证的编码偏好，由 Core 在首个视频会话注册前选择 H.265 或 H.264，持久配置仍为 `auto`。H.265 使用 VC8000E 的 HEVC Main、8-bit 4:2:0 硬件编码路径，不在 CPU 上做视频软件编码。创建、重置、编码器查询及每个输出包都必须使用实际选中的格式，不能只开放配置选项。
