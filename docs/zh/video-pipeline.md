@@ -11,7 +11,7 @@ Pro 的 `lt6911` 内核驱动通过实际寄存器 ID 区分芯片，旧
 
 | 型号 | ID 页与值 | 状态／时序 | EDID／板型字符串 |
 | --- | --- | --- | --- |
-| UXC | 81:00–02 = 17 04 83 | 保留既有实现 | EDID 使用 Shadow RAM＋HPD，偏好存入用户数据；板型字符串仍为独立 Flash 操作 |
+| UXC | 81:00–02 = 17 04 83 | 保留既有实现 | 永久 EDID 写 Flash；临时 EDID 使用 Shadow RAM＋HPD；板型字符串为独立 Flash 操作 |
 | C | A0:00–01 = 16 05 | D2 测量、C2 CSI 尺寸、D1 采样率 | 0x18000 EDID 读写；保留周边数据，板型字符串不可写 |
 | D | E0:80–83 = 25 10 23 01 | E0 尺寸、总时序、半像素时钟及采样率 | 独立 E0/E1 Flash 序列，保留并校验板型字符串 |
 
@@ -289,8 +289,9 @@ source 生命周期和 VIN 操作，拒绝仍被外部借用的原始帧，等�
 释放 TDP／VENC 的 VIN 导入并确认 STREAMOFF；失败时不访问 EDID 接口。
 写入期间阻止重新开流，结束后由既有绑定／模式检测重建 VIN，并从 IDR 恢复。
 
-UXC 正常设置路径只写 `/proc/lt6911_info/edid_shadow`；旧 `/edid` 的 UXC
-读写也分别指向缓存和同一 RAM writer。内核再次核对实际 UXC ID，保存
+UXC 永久设置写 `/proc/lt6911_info/edid`，使用既有 UXC Flash 协议，保留板型
+字符串并回读校验；成功后清除旧临时覆盖，再重启桥片从 Flash 加载。相同 Flash
+内容不重复擦写。临时设置使用内核 Shadow 接口；内核再次核对实际 UXC ID，保存
 80EE、8010、B00A、B00B、B000，在 HPD 低期间双读原 Shadow，清 B00B bit 2，
 经 B00A／B0B0 写入、完整校验，并在恢复 MCU 访问后再校验一次。
 只按位改变 HPD／Shadow 控制位。成功修改保持 8010=0，避免看门狗重载旧 EDID；
@@ -298,11 +299,10 @@ UXC 正常设置路径只写 `/proc/lt6911_info/edid_shadow`；旧 `/edid` 的 U
 读取和失败回退恢复原看门狗值。回退失败时清除缓存并尝试保持 HPD 低，不能
 把部分 EDID 宣告为成功。该事务不包含 Flash 控制器写入或桥片 GPIO 复位。
 
-UXC 偏好保存在 `/var/lib/onekvm/edid/active.bin`，写 RAM 前先暂存新值和旧文件
-备份并 fsync。RAM 验证后原子替换偏好并 fsync 目录；发布失败会尝试回退 RAM
-与偏好。机型 hook 在启动及 Core 启动前恢复 RAM，相同值只比较不重写；
-内核控制的桥片掉电恢复会重放本次启动保存的 RAM 值。未知 Shadow 状态不回退
-Flash，启动时保留固件 EDID、继续启动 Core，API 不提供写入能力。
+永久设置不保存或回放用户分区的 EDID 偏好。机型 hook 仅在首次初始化时设置
+Flash 默认值，后续启动不覆盖用户永久值，也不在 Core 重启前恢复 RAM。
+内核控制的桥片掉电恢复可重放本次启动的临时 RAM 值；整机重启后从 Flash
+恢复永久值。缺少 Shadow 支持只禁用临时能力，不能禁用独立 Flash 写入。
 C/D 仍走各自 Flash 协议及校验；C 不自动初始化。
 
 LT6911UXC 的 HDMI 接收尺寸和 CSI 有效像素可能在不同时刻就绪。后端每 100 ms
@@ -349,7 +349,10 @@ UXC Shadow 的寄存器依据为 2026-10-26 的 107 实测，固件整片 SHA-25
 
 公共 ABI 提供 `edid_set_mode` 可选表尾时，Pro UXC 同时声明
 `CAP_TEMPORARY`。临时模式只执行同一 VIN 暂停和内核 Shadow 事务，不创建、
-暂存或更新偏好文件；Core 重启前的机型 hook 会恢复永久偏好，整机重启也会
-恢复它。内核控制的桥片掉电／上电仍重放本次启动的当前 RAM 值。C/D 不声明
+暂存或更新偏好文件。Core 重启不改写 EDID；整机重启从 Flash 恢复永久值。
+内核控制的桥片掉电／上电仍重放本次启动的当前 RAM 值。C/D 不声明
 该能力，临时请求在停流或 Flash 访问之前拒绝。旧 ABI 头构建保留永久接口，
 不声明无法描述的临时回调；公共 Core/UI 的新入口由对应任务交付。
+
+HTTP 复用同一个 EDID 应用接口，通过请求体 `mode: "permanent"`／
+`"temporary"` 选择；不增加独立的 Shadow API 路由。旧 `edid_set` 保持写 Flash。

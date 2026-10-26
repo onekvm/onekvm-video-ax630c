@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: MIT */
 #include "../src/ax_edid.h"
-#include "../src/ax_edid_storage.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -15,7 +14,7 @@ static int writable = 1, missing, interrupted, write_error, short_write, writes,
 static const char *chip_id = "lt6911uxc\n";
 static size_t chip_offset;
 static int chip_missing, chip_read_error;
-static int paused, pause_error, shadow_missing, stage_error, publish_error, stages, publications;
+static int paused, pause_error, shadow_missing, expect_temporary, flash_writes, shadow_writes, close_error;
 int ax_edid_capture_begin(char *error, uint32_t capacity) {
     (void)error; (void)capacity;
     assert(!paused);
@@ -23,18 +22,6 @@ int ax_edid_capture_begin(char *error, uint32_t capacity) {
     paused = 1; return 0;
 }
 void ax_edid_capture_end(void) { assert(paused); paused = 0; }
-int ax_edid_storage_prepare(struct ax_edid_storage *s, const char *dir, const uint8_t data[256]) {
-    (void)s; (void)data;
-    assert(!paused && !strcmp(dir, "/var/lib/onekvm/edid"));
-    stages++; return stage_error ? -1 : 0;
-}
-int ax_edid_storage_publish(struct ax_edid_storage *s) {
-    (void)s; assert(paused); publications++; return publish_error ? -1 : 0;
-}
-int ax_edid_storage_finish(struct ax_edid_storage *s, int commit) {
-    (void)s; (void)commit; return 0;
-}
-
 int __wrap_access(const char *path, int mode)
 {
     assert(mode == W_OK);
@@ -62,8 +49,9 @@ int __wrap_open(const char *path, int flags, ...)
     }
     assert(flags == (O_WRONLY | O_CLOEXEC));
     assert(paused);
-    assert(!strcmp(path, !strcmp(chip_id, "lt6911uxc\n") ?
+    assert(!strcmp(path, expect_temporary ?
                          "/proc/lt6911_info/edid_shadow" : "/proc/lt6911_info/edid"));
+    if (expect_temporary) shadow_writes++; else flash_writes++;
     if (!writable) { errno = EACCES; return -1; }
     return 702;
 }
@@ -103,7 +91,7 @@ ssize_t __wrap_write(int fd, const void *data, size_t size)
 int __wrap_close(int fd)
 {
     assert(fd == 700 || fd == 701 || fd == 702);
-    return 0;
+    return fd == 702 && close_error ? -1 : 0;
 }
 
 int main(void)
@@ -126,9 +114,16 @@ int main(void)
                          ));
     assert(caps.apply_policy == ONEKVM_VIDEO_EDID_APPLY_HOTPLUG);
     assert(!strcmp(caps.chip_id, "LT6911UXC") && !strcmp(caps.board_id, "pro"));
+#ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
     assert(opens == 2);
+#else
+    assert(opens == 1);
+#endif
     shadow_missing = 1;
-    assert(ax_edid_capabilities(&caps) == 0 && caps.flags == 0);
+    assert(ax_edid_capabilities(&caps) == 0 && (caps.flags & ONEKVM_VIDEO_EDID_CAP_PERSISTENT));
+#ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
+    assert(!(caps.flags & ONEKVM_VIDEO_EDID_CAP_TEMPORARY));
+#endif
     shadow_missing = 0;
     chip_id = "lt6911d\n";
     interrupted = 1;
@@ -225,36 +220,42 @@ int main(void)
     short_write = 0;
     chip_id = "lt6911uxc\n";
     before = writes;
-    stage_error = 1;
-    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before && !paused);
-    stage_error = 0;
     pause_error = 1;
     assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before && !paused);
     pause_error = 0;
+    shadow_missing = 1;
     assert(ax_edid_set(&blob, &apply, error, sizeof(error)) == 0 && writes == before + 1 && !paused);
-    assert(publications == 1 && stages == 3);
-    publish_error = 1;
-    blob.data[12]++; blob.data[127]--;
+    assert(shadow_writes == 0 && flash_writes > 0);
+    shadow_missing = 0;
     before = writes;
-    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before + 2 && !paused);
-    assert(!memcmp(programmed, snapshot, 256));
-    blob.data[12]--; blob.data[127]++;
-    publish_error = 0;
+    close_error = 1;
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before + 1 && !paused);
+    close_error = 0;
 #ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
     caps.struct_size = sizeof(caps);
-    int old_stages = stages, old_publications = publications;
+    int old_flash_writes = flash_writes;
+    expect_temporary = 1;
     before = writes;
     assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_TEMPORARY, &apply, error, sizeof(error)) == 0);
-    assert(writes == before + 1 && stages == old_stages && publications == old_publications && !paused);
+    assert(writes == before + 1 && flash_writes == old_flash_writes && shadow_writes == 1 && !paused);
     assert(apply.apply_required == ONEKVM_VIDEO_EDID_APPLY_HOTPLUG);
     for (unsigned chip = 0; chip < 2; chip++) {
         chip_id = chip ? "lt6911c\n" : "lt6911d\n";
         before = writes;
         assert(ax_edid_capabilities(&caps) == 0 && !(caps.flags & ONEKVM_VIDEO_EDID_CAP_TEMPORARY));
         assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_TEMPORARY, &apply, error, sizeof(error)) != 0);
-        assert(writes == before && stages == old_stages && !paused);
+        assert(writes == before && flash_writes == old_flash_writes && !paused);
     }
     chip_id = "lt6911uxc\n";
+    shadow_missing = 1;
+    assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_TEMPORARY, &apply, error, sizeof(error)) != 0);
+    assert(writes == before && flash_writes == old_flash_writes);
+    shadow_missing = 0;
+    expect_temporary = 0;
+    before = writes;
+    assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_PERMANENT, &apply, error, sizeof(error)) == 0);
+    assert(writes == before + 1 && flash_writes == old_flash_writes + 1 && shadow_writes == 1);
+    before = writes;
     assert(ax_edid_set_mode(&blob, 99, &apply, error, sizeof(error)) != 0 && writes == before);
 #endif
     assert(ax_edid_get(NULL, error, sizeof(error)) != 0);

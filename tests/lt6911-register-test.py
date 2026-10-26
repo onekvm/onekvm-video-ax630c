@@ -17,7 +17,7 @@ source = driver.read_text()
 names = '''lt6911_write lt6911_read lt6911_read_be16 lt6911_write_block
 lt6911_read_block lt6911_write_sys_seq lt6911_enable lt6911_disable
 lt6911_disable_watchdog lt6911_chip_name lt6911_check_chip_id
-lt6911_set_power lt6911_get_rx_geometry lt6911_get_signal_state lt6911_get_res lt6911_get_fps
+lt6911_set_power lt6911_power_cycle lt6911_get_rx_geometry lt6911_get_signal_state lt6911_get_res lt6911_get_fps
 lt6911uxc_shadow_payload lt6911uxc_shadow_restore lt6911uxc_shadow_apply
 lt6911c_flash_end lt6911c_flash_address lt6911c_flash_read lt6911c_flash_ack
 lt6911c_flash_prepare lt6911c_flash_erase lt6911c_flash_write_page
@@ -26,7 +26,7 @@ lt6911d_seq lt6911d_flash_begin lt6911d_flash_end lt6911d_flash_reset_fifo
 lt6911d_flash_addr lt6911d_flash_read lt6911d_flash_erase lt6911d_flash_write_page
 lt6911d_write_metadata lt6911d_edid_write lt6911_flash_ack
 lt6911_flash_write_page lt6911_flash_read_page lt6911_version_read
-lt6911_version_write lt6911_edid_read lt6911_edid_write
+lt6911_version_write lt6911_edid_read lt6911_edid_write lt6911_edid_apply_permanent
 lt6911_video_lost lt6911_init_text'''.split()
 parts = []
 for name in names:
@@ -92,7 +92,7 @@ static unsigned c_reads, unstable_read, erase_size = 4096, bad_program;
 static int alloc_failure;
 static unsigned erase_call, program_call;
 static u8 shadow[256];
-static unsigned shadow_mode, shadow_writes, corrupt_shadow;
+static unsigned shadow_mode, shadow_writes, corrupt_shadow, uxc_flash_mode, power_switches;
 #define GFP_KERNEL 0
 static void *kvmalloc(size_t size, int flags) {
     (void)flags;
@@ -112,6 +112,8 @@ static int gpiod_set_value_cansleep(void *gpio, bool on) {
     (void)gpio;
     if (gpio_fault) return -EIO;
     gpio_power = on;
+    power_switches++;
+    if (uxc_flash_mode && on) memcpy(shadow, flash + 0x18000, 256);
     return 0;
 }
 static int bus_fault(void) { return ++calls == fail_at ? -EIO : 0; }
@@ -153,7 +155,8 @@ static int i2c_smbus_write_byte_data(void *client, u8 reg, u8 value) {
         programs++;
     }
     if (bank == 0x80 && reg == 0x5a && value == 0x86) fifo_len = 0;
-    if (bank == 0x80 && reg == 0x5a && value == 0x83) {
+    if (bank == 0x80 && reg == 0x5a &&
+        (value == 0x83 || (uxc_flash_mode && value == 0x81))) {
         unsigned addr = address();
         assert(addr == 0x18000);
         erase_call = calls;
@@ -162,8 +165,9 @@ static int i2c_smbus_write_byte_data(void *client, u8 reg, u8 value) {
         memset(flash + addr, 0xff, erase_size);
         erases++;
     }
-    if (bank == 0x80 && reg == 0x5a && value == 0x92 &&
-        regs[bank][0x5e] == 0xe0 && fifo_len) {
+    if (bank == 0x80 && reg == 0x5a && fifo_len &&
+        ((value == 0x92 && regs[bank][0x5e] == 0xe0) ||
+         (uxc_flash_mode && value == 0x90 && regs[bank][0x5e] == 0xc0))) {
         unsigned addr = address();
         assert(addr >= 0x18000 && addr + fifo_len <= sizeof(flash));
         for (unsigned i = 0; i < fifo_len; i++) flash[addr + i] &= fifo[i];
@@ -206,6 +210,7 @@ static void reset(void) {
     bank = fifo_len = calls = fail_at = erases = programs = short_block = 0;
     c_reads = unstable_read = bad_program = alloc_failure = 0;
     erase_call = program_call = shadow_mode = shadow_writes = corrupt_shadow = 0;
+    uxc_flash_mode = power_switches = gpio_fault = 0;
     regs[0x90][2] = 0xff;
 }
 static void be16(u8 b, u8 r, unsigned v) { regs[b][r] = v >> 8; regs[b][r+1] = v; }
@@ -499,6 +504,48 @@ int main(void) {
     memcpy(shadow, original, 256);
     assert(!lt6911_set_power(&lt, true) && !memcmp(shadow, edid, 256));
     printf("UXC Shadow: %u transaction failure points; no flash operations; rail restore/retry verified\n", shadow_calls);
+    /* Permanent UXC writes Flash, not the active temporary RAM contents. */
+    u8 permanent[256];
+    memcpy(permanent, original, 256);
+    permanent[12] = 77; permanent[127] -= 77;
+    reset(); uxc_flash_mode = 1; lt.chip = LT6911_CHIP_UXC;
+    regs[0x81][8] = 0xee;
+    memcpy(flash + 0x18000, original, 256);
+    memset(flash + 0x18100, 0, 32);
+    memcpy(flash + 0x18100, "NanoKVM Pro Desk", 16);
+    memcpy(version, flash + 0x18100, 32);
+    memcpy(shadow, edid, 256);
+    memcpy(lt.shadow_desired, edid, 256);
+    lt.shadow_override = lt.shadow_restore_pending = true;
+    assert(!lt6911_edid_apply_permanent(&lt, permanent, readback));
+    unsigned permanent_calls = calls;
+    assert(erases == 1 && programs == 9 && power_switches == 2);
+    assert(!memcmp(flash + 0x18000, permanent, 256));
+    assert(!memcmp(flash + 0x18100, version, 32));
+    assert(!memcmp(shadow, permanent, 256) && !shadow_writes);
+    assert(!lt.shadow_override && !lt.shadow_restore_pending);
+    assert(lt.edid_snapshot_len == 256 && !memcmp(lt.edid_snapshot, permanent, 256));
+    assert(!lt6911_edid_apply_permanent(&lt, permanent, readback));
+    assert(erases == 1 && programs == 9); /* identical Flash is not erased */
+    for (unsigned n = 1; n <= permanent_calls; n++) {
+        reset(); uxc_flash_mode = 1; regs[0x81][8] = 0xee;
+        memcpy(flash + 0x18000, original, 256);
+        memcpy(flash + 0x18100, version, 32);
+        memcpy(shadow, edid, 256);
+        lt.shadow_override = lt.shadow_restore_pending = true;
+        fail_at = n;
+        assert(lt6911_edid_apply_permanent(&lt, permanent, readback) < 0);
+        assert(lt.shadow_override && lt.shadow_restore_pending && !power_switches);
+        assert(!memcmp(shadow, edid, 256));
+    }
+    reset(); uxc_flash_mode = 1; regs[0x81][8] = 0xee;
+    memcpy(flash + 0x18000, original, 256);
+    lt.shadow_override = true; gpio_fault = 1;
+    assert(lt6911_edid_apply_permanent(&lt, permanent, readback) == -EIO);
+    assert(!lt.shadow_override && !lt.edid_snapshot_len);
+    assert(!memcmp(flash + 0x18000, permanent, 256));
+    printf("UXC permanent Flash: %u I2C failure points; temporary override cleared only after verification\n", permanent_calls);
+
     printf("LT6911 UXC/C/D register tests passed (D %u, C %u read failure points; "
            "C prepare/erase/page %u/%u/%u, writer %u)\n", read_calls, c_read_calls,
            prepare_calls, erase_calls, page_calls, write_failures);

@@ -1,7 +1,7 @@
 SUMMARY = "AX630C native HDMI capture and VC8000E video backend"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
-PR = "r11"
+PR = "r12"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
 COMPATIBLE_MACHINE = "^onekvm-nanokvm-pro$"
@@ -38,7 +38,7 @@ do_compile() {
         -I/sources/onekvm-core/include \
         -I/sources/onekvm-generic-v4l2/include \
         -o ${B}/ax630c.so \
-        ${S}/src/ax630c_video.c ${S}/src/ax_rate.c ${S}/src/ax_edid.c ${S}/src/ax_edid_storage.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c ${S}/src/ax_tdp.c ${S}/src/ax_snapshot.c \
+        ${S}/src/ax630c_video.c ${S}/src/ax_rate.c ${S}/src/ax_edid.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c ${S}/src/ax_tdp.c ${S}/src/ax_snapshot.c \
         ${S}/src/ax_vdec.c /sources/onekvm-generic-v4l2/src/v4l2_transform.c \
         $(pkg-config --libs gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0) -lm -ljpeg
     ${CC} ${CFLAGS} ${LDFLAGS} -DAX630C_STANDALONE -pthread \
@@ -46,7 +46,7 @@ do_compile() {
         -I/sources/onekvm-core/include \
         -I/sources/onekvm-generic-v4l2/include \
         -o ${B}/ax630c-once \
-        ${S}/src/ax630c_video.c ${S}/src/ax_rate.c ${S}/src/ax_edid.c ${S}/src/ax_edid_storage.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c ${S}/src/ax_tdp.c ${S}/src/ax_snapshot.c \
+        ${S}/src/ax630c_video.c ${S}/src/ax_rate.c ${S}/src/ax_edid.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c ${S}/src/ax_tdp.c ${S}/src/ax_snapshot.c \
         /sources/onekvm-generic-v4l2/src/v4l2_transform.c -lm -ljpeg
     ${CC} ${CFLAGS} ${LDFLAGS} -I${B}/include \
         -o ${B}/ax630c-eip130-ioctl-test ${S}/tests/eip130-ioctl-test.c -pthread
