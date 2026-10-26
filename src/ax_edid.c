@@ -1,14 +1,20 @@
 /* SPDX-License-Identifier: MIT */
 #include "ax_edid.h"
+#include "ax_edid_storage.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
 #define EDID_BYTES 256u
 #define EDID_DEVICE "/proc/lt6911_info/edid"
+#define EDID_SHADOW "/proc/lt6911_info/edid_shadow"
+#define EDID_STATE_DIR "/var/lib/onekvm/edid"
+static pthread_mutex_t edid_update_lock = PTHREAD_MUTEX_INITIALIZER;
+
 #define EDID_SNAPSHOT "/proc/lt6911_info/edid_snapshot"
 #define CHIP_ID_DEVICE "/proc/lt6911_info/chip_id"
 
@@ -95,7 +101,12 @@ static int bridge_flash_supported(const char *chip)
                 return 0;
         return 1;
     }
-    return !strcmp(chip, "LT6911UXC") || !strcmp(chip, "LT6911D");
+    if (!strcmp(chip, "LT6911UXC")) {
+        uint8_t cached[EDID_BYTES];
+        return read_snapshot(cached) == 0 && valid_edid(cached, EDID_BYTES) &&
+               access(EDID_SHADOW, W_OK) == 0;
+    }
+    return !strcmp(chip, "LT6911D");
 }
 
 int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
@@ -107,7 +118,7 @@ int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
     caps->apply_policy = ONEKVM_VIDEO_EDID_APPLY_NONE;
     if (bridge_flash_supported(caps->chip_id)) {
         caps->flags = ONEKVM_VIDEO_EDID_CAP_PERSISTENT | ONEKVM_VIDEO_EDID_CAP_HOTPLUG;
-        if (access(EDID_DEVICE, W_OK) == 0)
+        if (access(!strcmp(caps->chip_id, "LT6911UXC") ? EDID_SHADOW : EDID_DEVICE, W_OK) == 0)
             caps->flags |= ONEKVM_VIDEO_EDID_CAP_WRITABLE;
         caps->apply_policy = ONEKVM_VIDEO_EDID_APPLY_HOTPLUG;
     }
@@ -139,20 +150,63 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
         return edid_error(error, capacity, "invalid EDID request");
     if (!valid_edid(edid->data, edid->size))
         return edid_error(error, capacity, "EDID must contain two valid 128-byte blocks");
-    if (!bridge_flash_supported(bridge_chip()))
-        return edid_error(error, capacity, "HDMI bridge does not support EDID flash writing");
-    int fd = open(EDID_DEVICE, O_WRONLY | O_CLOEXEC);
-    if (fd < 0)
-        return edid_error(error, capacity, "open HDMI EDID for writing");
-    /* One complete write: the driver preserves the chip's surrounding
-     * metadata, verifies readback and cycles the bridge to advertise EDID. */
+    const char *chip = bridge_chip();
+    const int shadow = !strcmp(chip, "LT6911UXC");
+    if (!bridge_flash_supported(chip))
+        return edid_error(error, capacity, "HDMI bridge EDID interface is unavailable");
+    pthread_mutex_lock(&edid_update_lock);
+    struct ax_edid_storage storage;
+    int prepared = 0, paused = 0, result = -1;
+    const char *failure = "write or verify HDMI EDID failed";
+    struct onekvm_video_edid_blob_v1 before = {.struct_size = sizeof(before)};
+    if (shadow) {
+        if (ax_edid_get(&before, NULL, 0)) {
+            failure = "current Shadow EDID is unavailable";
+            goto out;
+        }
+        if (ax_edid_storage_prepare(&storage, EDID_STATE_DIR, edid->data)) {
+            failure = "stage persistent EDID preference failed";
+            goto out;
+        }
+        prepared = 1;
+    }
+    if (ax_edid_capture_begin(error, capacity)) {
+        failure = NULL;
+        goto out;
+    }
+    paused = 1;
+    int fd = open(shadow ? EDID_SHADOW : EDID_DEVICE, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) goto out;
     ssize_t written;
     do {
         written = write(fd, edid->data, EDID_BYTES);
     } while (written < 0 && errno == EINTR);
     int closed = close(fd);
-    if (written != EDID_BYTES || closed != 0)
-        return edid_error(error, capacity, "write or verify HDMI EDID failed");
+    if (written == EDID_BYTES && shadow && (closed || ax_edid_storage_publish(&storage))) {
+        /* Both the old preference and new preference were staged before
+         * touching RAM. Roll back RAM and disk if publication fails. */
+        int rollback_fd = open(EDID_SHADOW, O_WRONLY | O_CLOEXEC);
+        ssize_t restored = -1;
+        if (rollback_fd >= 0) {
+            do {
+                restored = write(rollback_fd, before.data, EDID_BYTES);
+            } while (restored < 0 && errno == EINTR);
+            if (close(rollback_fd)) restored = -1;
+        }
+        failure = restored == EDID_BYTES ? "persist EDID preference failed; RAM restored" :
+                                          "persist EDID preference and RAM rollback failed";
+        written = -1;
+    }
+    if (written != EDID_BYTES || closed) goto out;
     apply->apply_required = ONEKVM_VIDEO_EDID_APPLY_HOTPLUG;
-    return 0;
+    result = 0;
+out:
+    if (prepared && ax_edid_storage_finish(&storage, result == 0)) {
+        failure = "persistent EDID preference rollback failed";
+        result = -1;
+    }
+    if (paused) ax_edid_capture_end();
+    pthread_mutex_unlock(&edid_update_lock);
+    if (result && failure) return edid_error(error, capacity, failure);
+    return result;
 }

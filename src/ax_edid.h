@@ -11,4 +11,7 @@ int32_t ax_edid_set(const struct onekvm_video_edid_blob_v1 *edid,
                     struct onekvm_video_edid_apply_result_v1 *apply,
                     char *error, uint32_t capacity);
 
+int ax_edid_capture_begin(char *error, uint32_t capacity);
+void ax_edid_capture_end(void);
+
 #endif

@@ -70,7 +70,11 @@
 #define AX_SIGNAL_LOSS_GRACE_MS 3200u
 #define AX_MODE_POLL_INTERVAL_MS 100u
 
+static pthread_mutex_t ax_edid_sources_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ax_source *ax_edid_sources;
+
 struct ax_source {
+    struct ax_source *edid_next;
     char device[256];
     pthread_mutex_t lock;
     /* Encoded-session display reads only this cache; display-only capture
@@ -124,7 +128,7 @@ struct ax_source {
     atomic_uint_fast64_t input_geometry;
     atomic_uint input_fps;
     int32_t output_resolution;
-    int streaming;
+    atomic_int streaming;
     int held;
     uint32_t held_index;
     uint64_t capture_ns;
@@ -641,7 +645,7 @@ static int32_t ax_source_display(void *source,
 
 static void ax_release_imports(struct ax_source *src);
 
-static void ax_capture_stop(struct ax_source *src)
+static int ax_capture_stop(struct ax_source *src)
 {
     ax_collect_display_job(src, 1, 0);
     /* Transform queues cache DMA-BUF imports beyond the last conversion.
@@ -654,16 +658,18 @@ static void ax_capture_stop(struct ax_source *src)
     src->display_placeholder = 0;
     pthread_mutex_unlock(&src->display_lock);
     src->display_stalled_since_ms = 0;
+    int result = 0;
     unsigned int i;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     ax_release_imports(src);
 
     if (src->cap_fd < 0)
-        return;
+        return 0;
     src->held = 0;
     if (src->streaming) {
-        ioctl(src->cap_fd, VIDIOC_STREAMOFF, &type);
+        if (ioctl(src->cap_fd, VIDIOC_STREAMOFF, &type) < 0)
+            result = -1;
         src->streaming = 0;
     }
     for (i = 0; i < src->nbufs; i++) {
@@ -683,6 +689,38 @@ static void ax_capture_stop(struct ax_source *src)
     }
     close(src->cap_fd);
     src->cap_fd = -1;
+    return result;
+}
+
+/* Registry protects source lifetime. All VIN locks precede any EDID I/O;
+ * worker completion never needs a VIN lock, so in-flight conversions drain. */
+void ax_edid_capture_end(void)
+{
+    for (struct ax_source *src = ax_edid_sources; src; src = src->edid_next)
+        pthread_mutex_unlock(&src->lock);
+    pthread_mutex_unlock(&ax_edid_sources_lock);
+}
+
+int ax_edid_capture_begin(char *error, uint32_t capacity)
+{
+    pthread_mutex_lock(&ax_edid_sources_lock);
+    for (struct ax_source *src = ax_edid_sources; src; src = src->edid_next)
+        pthread_mutex_lock(&src->lock);
+    for (struct ax_source *src = ax_edid_sources; src; src = src->edid_next) {
+        if (src->held) {
+            ax_err(error, capacity, "EDID waits for a borrowed video frame");
+            ax_edid_capture_end();
+            return -1;
+        }
+    }
+    for (struct ax_source *src = ax_edid_sources; src; src = src->edid_next) {
+        if (ax_capture_stop(src)) {
+            ax_err(error, capacity, "stop VIN before EDID failed");
+            ax_edid_capture_end();
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int ax_capture_start(struct ax_source *src, uint32_t width, uint32_t height,
@@ -1394,6 +1432,7 @@ static void ax_source_init(struct ax_source *src)
     pthread_cond_init(&src->display_cv, &attr);
     pthread_cond_init(&src->snapshot_cv, &attr);
     pthread_condattr_destroy(&attr);
+    atomic_init(&src->streaming, 0);
     atomic_init(&src->interrupted, 0);
     atomic_init(&src->display_requested_ms, 0);
     atomic_init(&src->display_published_ms, 0);
@@ -1431,6 +1470,10 @@ static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *conf
         ax_err_errno(error, error_cap, "display worker");
         goto fail;
     }
+    pthread_mutex_lock(&ax_edid_sources_lock);
+    src->edid_next = ax_edid_sources;
+    ax_edid_sources = src;
+    pthread_mutex_unlock(&ax_edid_sources_lock);
     *source = src;
     return 0;
 fail:
@@ -1517,6 +1560,10 @@ static void ax_source_destroy(void *source)
 
     if (!src)
         return;
+    pthread_mutex_lock(&ax_edid_sources_lock);
+    struct ax_source **link = &ax_edid_sources;
+    while (*link && *link != src) link = &(*link)->edid_next;
+    if (*link) *link = src->edid_next;
     pthread_mutex_lock(&src->lock);
     ax_capture_stop(src);
     ax_stop_display_worker(src);
@@ -1535,6 +1582,7 @@ static void ax_source_destroy(void *source)
     pthread_mutex_destroy(&src->display_lock);
     pthread_mutex_destroy(&src->lock);
     free(src);
+    pthread_mutex_unlock(&ax_edid_sources_lock);
 }
 
 static int32_t ax_source_input_format(void *source, struct onekvm_video_format_v1 *format)
@@ -1979,6 +2027,8 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         enc->last_placeholder_ms = ax_now_ms();
         goto encoded;
     }
+    if (!src->streaming && ax_encoder_bind_source(enc, src, error, error_cap) != 0)
+        return -1;
     if (!src->streaming) {
         ax_err(error, error_cap, "capture is not streaming");
         return -1;
@@ -1986,6 +2036,19 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
     if (ax_wait_encode_slot(enc, src, error, error_cap) != 0)
         return -1;
     pthread_mutex_lock(&src->lock);
+    /* An EDID update may have stopped VIN while pacing this packet. */
+    if (!src->streaming) {
+        pthread_mutex_unlock(&src->lock);
+        enc->last_mode_ms = 0;
+        if (ax_encoder_bind_source(enc, src, error, error_cap) != 0)
+            return -1;
+        pthread_mutex_lock(&src->lock);
+        if (!src->streaming) {
+            pthread_mutex_unlock(&src->lock);
+            ax_err(error, error_cap, "capture waits for HDMI after EDID update");
+            return -1;
+        }
+    }
     rc = ax_grab_frame(src, &frame, &stride, error, error_cap);
     if (rc == 2 && src->width >= 64 && src->height >= 64) {
         uint32_t mode_w, mode_h, mode_fps;

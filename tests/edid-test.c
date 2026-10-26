@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "../src/ax_edid.h"
+#include "../src/ax_edid_storage.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -14,10 +15,32 @@ static int writable = 1, missing, interrupted, write_error, short_write, writes,
 static const char *chip_id = "lt6911uxc\n";
 static size_t chip_offset;
 static int chip_missing, chip_read_error;
+static int paused, pause_error, shadow_missing, stage_error, publish_error, stages, publications;
+int ax_edid_capture_begin(char *error, uint32_t capacity) {
+    (void)error; (void)capacity;
+    assert(!paused);
+    if (pause_error) return -1;
+    paused = 1; return 0;
+}
+void ax_edid_capture_end(void) { assert(paused); paused = 0; }
+int ax_edid_storage_prepare(struct ax_edid_storage *s, const char *dir, const uint8_t data[256]) {
+    (void)s; (void)data;
+    assert(!paused && !strcmp(dir, "/var/lib/onekvm/edid"));
+    stages++; return stage_error ? -1 : 0;
+}
+int ax_edid_storage_publish(struct ax_edid_storage *s) {
+    (void)s; assert(paused); publications++; return publish_error ? -1 : 0;
+}
+int ax_edid_storage_finish(struct ax_edid_storage *s, int commit) {
+    (void)s; (void)commit; return 0;
+}
 
 int __wrap_access(const char *path, int mode)
 {
-    assert(!strcmp(path, "/proc/lt6911_info/edid") && mode == W_OK);
+    assert(mode == W_OK);
+    if (!strcmp(path, "/proc/lt6911_info/edid_shadow"))
+        return writable && !shadow_missing ? 0 : -1;
+    assert(!strcmp(path, "/proc/lt6911_info/edid"));
     return writable ? 0 : -1;
 }
 
@@ -38,7 +61,9 @@ int __wrap_open(const char *path, int flags, ...)
         return 701;
     }
     assert(flags == (O_WRONLY | O_CLOEXEC));
-    assert(!strcmp(path, "/proc/lt6911_info/edid"));
+    assert(paused);
+    assert(!strcmp(path, !strcmp(chip_id, "lt6911uxc\n") ?
+                         "/proc/lt6911_info/edid_shadow" : "/proc/lt6911_info/edid"));
     if (!writable) { errno = EACCES; return -1; }
     return 702;
 }
@@ -66,7 +91,7 @@ ssize_t __wrap_read(int fd, void *data, size_t size)
 
 ssize_t __wrap_write(int fd, const void *data, size_t size)
 {
-    assert(fd == 702 && size == sizeof(programmed));
+    assert(paused && fd == 702 && size == sizeof(programmed));
     writes++;
     if (interrupted) { interrupted = 0; errno = EINTR; return -1; }
     if (write_error) { errno = EIO; return -1; }
@@ -97,7 +122,10 @@ int main(void)
                          ONEKVM_VIDEO_EDID_CAP_PERSISTENT | ONEKVM_VIDEO_EDID_CAP_HOTPLUG));
     assert(caps.apply_policy == ONEKVM_VIDEO_EDID_APPLY_HOTPLUG);
     assert(!strcmp(caps.chip_id, "LT6911UXC") && !strcmp(caps.board_id, "pro"));
-    assert(opens == 1);
+    assert(opens == 2);
+    shadow_missing = 1;
+    assert(ax_edid_capabilities(&caps) == 0 && caps.flags == 0);
+    shadow_missing = 0;
     chip_id = "lt6911d\n";
     interrupted = 1;
     assert(ax_edid_capabilities(&caps) == 0 && !strcmp(caps.chip_id, "LT6911D"));
@@ -190,6 +218,24 @@ int main(void)
     short_write = 1;
     int before = writes;
     assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before + 1);
+    short_write = 0;
+    chip_id = "lt6911uxc\n";
+    before = writes;
+    stage_error = 1;
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before && !paused);
+    stage_error = 0;
+    pause_error = 1;
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before && !paused);
+    pause_error = 0;
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) == 0 && writes == before + 1 && !paused);
+    assert(publications == 1 && stages == 3);
+    publish_error = 1;
+    blob.data[12]++; blob.data[127]--;
+    before = writes;
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before + 2 && !paused);
+    assert(!memcmp(programmed, snapshot, 256));
+    blob.data[12]--; blob.data[127]++;
+    publish_error = 0;
     assert(ax_edid_get(NULL, error, sizeof(error)) != 0);
     assert(ax_edid_set(NULL, &apply, error, sizeof(error)) != 0);
     assert(ax_edid_set(&blob, NULL, error, sizeof(error)) != 0);
