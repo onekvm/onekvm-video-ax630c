@@ -115,6 +115,15 @@ int main(void)
     snapshot[255]++;
     assert(ax_edid_capabilities(&caps) == 0 && caps.flags == 0);
     snapshot[255]--;
+    uint8_t original[256];
+    memcpy(original, snapshot, 256);
+    memset(snapshot, 0xff, 256);
+    assert(ax_edid_capabilities(&caps) == 0 && (caps.flags & ONEKVM_VIDEO_EDID_CAP_WRITABLE));
+    assert(ax_edid_get(&blob, error, sizeof(error)) != 0 && blob.size == 0);
+    memcpy(blob.data, original, 256); blob.size = 256;
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) == 0 && writes == 1);
+    writes = 0;
+    memcpy(snapshot, original, 256);
     chip_id = "unknown\n";
     assert(ax_edid_capabilities(&caps) == 0 && !strcmp(caps.chip_id, "LT6911"));
     assert(caps.flags == 0);

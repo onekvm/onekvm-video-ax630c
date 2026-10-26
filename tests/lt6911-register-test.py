@@ -296,6 +296,11 @@ int main(void) {
     }
     erase_size = 4096;
     reset(); regs[0xa0][0] = 0x16; regs[0xa0][1] = 5;
+    assert(!lt6911_edid_read(&lt, readback));
+    assert(!memchr_inv(readback, 0xff, sizeof(readback)));
+    assert(!lt6911_edid_write(&lt, edid) && erases == 1);
+    reset(); regs[0xa0][0] = 0x16; regs[0xa0][1] = 5;
+    flash[0x18000] = 0;
     assert(lt6911_edid_read(&lt, readback) == -EOPNOTSUPP);
     assert(lt6911_edid_write(&lt, edid) == -EOPNOTSUPP && !erases);
     memcpy(flash + 0x18000, original, sizeof(original));

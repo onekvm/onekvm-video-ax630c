@@ -38,18 +38,6 @@ static const char *bridge_chip(void)
     return "LT6911";
 }
 
-static int bridge_flash_supported(const char *chip)
-{
-    if (!strcmp(chip, "LT6911C")) {
-        /* C firmware layouts vary. Only advertise a candidate whose EDID
-         * was validated by the driver. This reads RAM, never live flash;
-         * the driver checks the complete erase envelope again on writes. */
-        struct onekvm_video_edid_blob_v1 cached = {.struct_size = sizeof(cached)};
-        return ax_edid_get(&cached, NULL, 0) == 0;
-    }
-    return !strcmp(chip, "LT6911UXC") || !strcmp(chip, "LT6911D");
-}
-
 static int edid_error(char *error, uint32_t capacity, const char *message)
 {
     if (error && capacity)
@@ -70,6 +58,44 @@ static int valid_edid(const uint8_t *data, uint32_t size)
             return 0;
     }
     return 1;
+}
+
+static int read_snapshot(uint8_t *data)
+{
+    /* Reading /edid resets the bridge. The driver seeds this snapshot at
+     * probe and refreshes it after verified writes; UI reads must use it. */
+    int fd = open(EDID_SNAPSHOT, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    size_t size = 0;
+    while (size < EDID_BYTES) {
+        ssize_t n = read(fd, data + size, EDID_BYTES - size);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        size += (size_t)n;
+    }
+    close(fd);
+    return size == EDID_BYTES ? 0 : -1;
+}
+
+static int bridge_flash_supported(const char *chip)
+{
+    if (!strcmp(chip, "LT6911C")) {
+        /* Blank is the firmware-default slot, not an EDID to show as active.
+         * All reads are from RAM; writes recheck the whole erase envelope. */
+        uint8_t cached[EDID_BYTES];
+        if (read_snapshot(cached))
+            return 0;
+        if (valid_edid(cached, EDID_BYTES))
+            return 1;
+        for (unsigned i = 0; i < EDID_BYTES; i++)
+            if (cached[i] != 0xff)
+                return 0;
+        return 1;
+    }
+    return !strcmp(chip, "LT6911UXC") || !strcmp(chip, "LT6911D");
 }
 
 int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
@@ -96,22 +122,9 @@ int32_t ax_edid_get(struct onekvm_video_edid_blob_v1 *edid,
     if (!edid || edid->struct_size < sizeof(*edid))
         return edid_error(error, capacity, "invalid EDID buffer");
     edid->size = 0;
-    /* Reading /edid resets the bridge. The driver seeds this snapshot at
-     * probe and refreshes it after verified writes; UI reads must use it. */
-    int fd = open(EDID_SNAPSHOT, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return edid_error(error, capacity, "open HDMI EDID snapshot");
-    size_t size = 0;
-    while (size < EDID_BYTES) {
-        ssize_t n = read(fd, edid->data + size, EDID_BYTES - size);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            break;
-        size += (size_t)n;
-    }
-    close(fd);
-    if (!valid_edid(edid->data, size))
+    if (read_snapshot(edid->data))
+        return edid_error(error, capacity, "open or read HDMI EDID snapshot");
+    if (!valid_edid(edid->data, EDID_BYTES))
         return edid_error(error, capacity, "HDMI EDID snapshot is incomplete or invalid");
     edid->size = EDID_BYTES;
     return 0;
