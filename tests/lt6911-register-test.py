@@ -17,7 +17,7 @@ source = driver.read_text()
 names = '''lt6911_write lt6911_read lt6911_read_be16 lt6911_write_block
 lt6911_read_block lt6911_write_sys_seq lt6911_enable lt6911_disable
 lt6911_disable_watchdog lt6911_chip_name lt6911_check_chip_id
-lt6911_get_rx_geometry lt6911_get_signal_state lt6911_get_res lt6911_get_fps
+lt6911_set_power lt6911_get_rx_geometry lt6911_get_signal_state lt6911_get_res lt6911_get_fps
 lt6911uxc_shadow_payload lt6911uxc_shadow_restore lt6911uxc_shadow_apply
 lt6911c_flash_end lt6911c_flash_address lt6911c_flash_read lt6911c_flash_ack
 lt6911c_flash_prepare lt6911c_flash_erase lt6911c_flash_write_page
@@ -70,7 +70,11 @@ static void usleep_range(unsigned lo, unsigned hi) { (void)lo; (void)hi; }
 #include <stdarg.h>
 struct mock_text { char value[64]; };
 struct lt6911 {
-    void *client, *dev; int chip, buf_lock;
+    void *client, *dev, *pwr_gpio; int chip, buf_lock;
+    bool powered, shadow_override, shadow_restore_pending;
+    u8 shadow_desired[256], edid_snapshot[256];
+    size_t edid_snapshot_len;
+    struct mock_text power;
     struct mock_text status, width, height, fps, hdcp, asr;
 };
 static void mutex_lock(int *p) { (void)p; }
@@ -102,6 +106,14 @@ static void *memchr_inv(const void *p, int c, size_t n) {
     return NULL;
 }
 static int lt6911_check_edid(struct lt6911 *lt, const u8 *edid, size_t len);
+static int lt6911uxc_shadow_apply(struct lt6911 *lt, const u8 *desired, u8 *actual);
+static int gpio_fault, gpio_power;
+static int gpiod_set_value_cansleep(void *gpio, bool on) {
+    (void)gpio;
+    if (gpio_fault) return -EIO;
+    gpio_power = on;
+    return 0;
+}
 static int bus_fault(void) { return ++calls == fail_at ? -EIO : 0; }
 static unsigned address(void) {
     return ((unsigned)regs[bank][0x5b] << 16) |
@@ -470,7 +482,23 @@ int main(void) {
     corrupt_shadow = 1;
     assert(lt6911uxc_shadow_apply(&lt, edid, readback) == -EIO);
     assert(!memcmp(shadow, original, 256) && regs[0xb0][0] == 0x8d);
-    printf("UXC Shadow: %u transaction failure points; no flash operations\n", shadow_calls);
+    memcpy(lt.shadow_desired, edid, 256); lt.shadow_override = true;
+    lt.powered = true;
+    assert(!lt6911_set_power(&lt, false) && !gpio_power && lt.shadow_restore_pending);
+    memcpy(shadow, original, 256); calls = 0; fail_at = 1;
+    assert(lt6911_set_power(&lt, true) < 0 && gpio_power && lt.shadow_restore_pending);
+    assert(!lt.edid_snapshot_len);
+    fail_at = 0;
+    assert(!lt6911_set_power(&lt, true) && gpio_power && !lt.shadow_restore_pending);
+    assert(!memcmp(shadow, edid, 256) && !memcmp(lt.edid_snapshot, edid, 256));
+    assert(lt.edid_snapshot_len == 256);
+    gpio_fault = 1;
+    assert(lt6911_set_power(&lt, false) == -EIO && lt.powered && gpio_power);
+    gpio_fault = 0;
+    assert(!lt6911_set_power(&lt, false));
+    memcpy(shadow, original, 256);
+    assert(!lt6911_set_power(&lt, true) && !memcmp(shadow, edid, 256));
+    printf("UXC Shadow: %u transaction failure points; no flash operations; rail restore/retry verified\n", shadow_calls);
     printf("LT6911 UXC/C/D register tests passed (D %u, C %u read failure points; "
            "C prepare/erase/page %u/%u/%u, writer %u)\n", read_calls, c_read_calls,
            prepare_calls, erase_calls, page_calls, write_failures);
