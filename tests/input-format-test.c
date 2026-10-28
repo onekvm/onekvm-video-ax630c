@@ -6,6 +6,7 @@
 static const char *mode_width = "1920\n", *mode_height = "1080\n";
 static const char *mode_fps = "60\n", *mode_status = "stable\n";
 static unsigned reads;
+static const char *rx_geometry = "3840 2160\n";
 static const char *capture_device;
 
 FILE *__wrap_fopen(const char *path, const char *mode)
@@ -18,6 +19,7 @@ FILE *__wrap_fopen(const char *path, const char *mode)
     else if (strcmp(path, AX_PROC_W) == 0) data = mode_width;
     else if (strcmp(path, AX_PROC_H) == 0) data = mode_height;
     else if (strcmp(path, AX_PROC_FPS) == 0) data = mode_fps;
+    else if (strcmp(path, AX_PROC_RX_GEOMETRY) == 0) data = rx_geometry;
     assert(data != NULL);
     reads++;
     return fmemopen((void *)data, strlen(data), "r");
@@ -118,6 +120,47 @@ int main(void)
     assert(format.flags == 0xdeadbeef);
     format.struct_size--;
     assert(ax_source_input_format(&src, &format) == -1);
+    /* RX candidate remains usable even if firmware CSI metadata is stale. */
+    struct ax_encoder enc = {0};
+    src.width = 1280; src.height = 720;
+    uint32_t rw, rh;
+    assert(ax_confirm_new_rx_geometry(&enc, &src, &rw, &rh) == 0);
+    assert(rw == 3840 && rh == 2160);
+    assert(ax_recovery_due(&src, 1000));
+    assert(!ax_recovery_due(&src, 1249));
+    assert(ax_recovery_due(&src, 1250));
+    assert(!ax_recovery_due(&src, 1749));
+    /* STREAMON and a single frame must never publish the candidate. */
+    src.width = 3840; src.height = 2160; src.bytesperline = 7680;
+    struct v4l2_buffer buf = {.sequence = 0, .bytesused = 7680 * 2160, .flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC};
+    buf.timestamp.tv_sec = 10;
+    ax_observe_capture(&src, &buf);
+    assert(!atomic_load(&src.confirmed_mode));
+    for (unsigned i = 1; i <= 12; i++) {
+        uint64_t us = 10000000ull + i * 1000000ull / 30;
+        buf.timestamp.tv_sec = us / 1000000;
+        buf.timestamp.tv_usec = us % 1000000;
+        buf.sequence = i;
+        ax_observe_capture(&src, &buf);
+    }
+    assert(src.fps == 30 && src.recovery_attempts == 0);
+    /* Old CSI metadata cannot overwrite the real VIN-confirmed tuple. */
+    atomic_store(&src.streaming, 1);
+    assert(ax_source_signal_present(&src) == 1);
+    format.struct_size = sizeof(format);
+    assert(ax_source_input_format(&src, &format) == 0);
+    assert(format.width == 3840 && format.height == 2160 && format.fps == 30);
+    buf.flags = V4L2_BUF_FLAG_ERROR;
+    buf.sequence = 100;
+    ax_observe_capture(&src, &buf);
+    assert(src.fps == 30);
+    buf.flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    buf.bytesused = 100;
+    ax_observe_capture(&src, &buf);
+    assert(src.timing_frames == 0);
+    atomic_store(&src.streaming, 0);
+    assert(ax_capture_stop(&src) == 0);
+    assert(!atomic_load(&src.confirmed_mode));
     puts("input format: idle HDMI changes, loss/recovery, nonblocking queries and ABI bounds passed");
     return 0;
 }

@@ -127,6 +127,12 @@ struct ax_source {
      * wait for capture/display or reopen the capture device. */
     atomic_uint_fast64_t input_geometry;
     atomic_uint input_fps;
+    atomic_uint_fast64_t confirmed_mode;
+    uint64_t timing_first_ns;
+    uint32_t timing_first_seq;
+    unsigned timing_frames;
+    uint64_t recover_after_ms;
+    unsigned recovery_attempts, recovery_frames;
     int32_t output_resolution;
     atomic_int streaming;
     int held;
@@ -301,18 +307,75 @@ static int ax_rx_geometry(uint32_t *w, uint32_t *h)
     return 0;
 }
 
+/* RX geometry is independent of the firmware CSI metadata.  A stale CSI
+ * register must not veto a stable RX candidate; real VIN completions validate
+ * the candidate and provide cadence without guessing from stale fps. */
 static int ax_confirm_new_rx_geometry(struct ax_encoder *enc, struct ax_source *src,
                                       uint32_t *w, uint32_t *h)
 {
     uint32_t first_w, first_h;
-
-    if (enc->early_capture || ax_rx_geometry(&first_w, &first_h) != 0 ||
+    (void)enc;
+    if (ax_rx_geometry(&first_w, &first_h) != 0 ||
         (first_w == src->width && first_h == src->height))
         return -1;
-    usleep(10000);
+    usleep(20000);
     if (ax_rx_geometry(w, h) != 0 || *w != first_w || *h != first_h)
         return 1;
     return 0;
+}
+
+/* Called under the VIN lock; backoff is shared with display-only recovery. */
+static int ax_recovery_due(struct ax_source *src, uint64_t now)
+{
+    if (now < src->recover_after_ms) return 0;
+    unsigned shift = src->recovery_attempts < 4 ? src->recovery_attempts : 4;
+    src->recover_after_ms = now + (250u << shift);
+    if (src->recovery_attempts < 4) src->recovery_attempts++;
+    src->recovery_frames = 0;
+    return 1;
+}
+
+/* DQ timestamps and sequence numbers originate in VIN IRQ completions.  They
+ * still measure the input cadence when the encoder is paced or drops frames. */
+static void ax_observe_capture(struct ax_source *src, const struct v4l2_buffer *buf)
+{
+    uint64_t ns = (uint64_t)buf->timestamp.tv_sec * 1000000000ull +
+                  (uint64_t)buf->timestamp.tv_usec * 1000;
+    if ((buf->flags & V4L2_BUF_FLAG_ERROR) || !ns ||
+        (buf->flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) != V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC ||
+        buf->bytesused < (uint64_t)src->bytesperline * src->height) {
+        src->timing_frames = 0;
+        src->recovery_frames = 0;
+        return;
+    }
+    if (++src->recovery_frames >= 8) {
+        src->recovery_attempts = 0;
+        src->recover_after_ms = 0;
+    }
+    if (!src->timing_frames || ns <= src->timing_first_ns ||
+        buf->sequence - src->timing_first_seq > 1000) {
+        src->timing_first_ns = ns;
+        src->timing_first_seq = buf->sequence;
+        src->timing_frames = 1;
+        return;
+    }
+    src->timing_frames++;
+    uint64_t span = ns - src->timing_first_ns;
+    uint32_t frames = buf->sequence - src->timing_first_seq;
+    if (src->timing_frames < 8 || span < 200000000ull || !frames) return;
+    uint32_t fps = (frames * 1000000000ull + span / 2) / span;
+    if (fps < 10 || fps > 240 || span > 2000000000ull) {
+        src->timing_frames = 0;
+        return;
+    }
+    src->fps = fps;
+    uint64_t mode = ((uint64_t)src->width << 32) |
+                    ((uint64_t)src->height << 16) | fps;
+    if (!atomic_load(&src->confirmed_mode))
+        fprintf(stderr, "ax630c: VIN confirmed %ux%u @ %u from %u completed frames\n",
+                src->width, src->height, fps, src->timing_frames);
+    atomic_store_explicit(&src->confirmed_mode, mode, memory_order_release);
+    ax_publish_input_mode(src, src->width, src->height, fps);
 }
 
 /* Publish only while a display consumer is active, at most 15 fps. The input
@@ -598,7 +661,8 @@ static int32_t ax_source_display(void *source,
                  * Do not restart during bridge signal loss or a mode change. */
                 if (ax_now_ms() - src->display_stalled_since_ms >= 300 &&
                     ax_hdmi_mode(&w, &h, &fps) == 0 &&
-                    w == src->width && h == src->height) {
+                    w == src->width && h == src->height &&
+                    ax_recovery_due(src, ax_now_ms())) {
                     int import_fd = src->import_venc_fd;
                     fprintf(stderr, "ax630c: display capture stalled, restarting DMA ring\n");
                     if (ax_capture_start(src, w, h, error, cap) == 0 && import_fd >= 0)
@@ -648,6 +712,8 @@ static void ax_release_imports(struct ax_source *src);
 static int ax_capture_stop(struct ax_source *src)
 {
     ax_collect_display_job(src, 1, 0);
+    atomic_store(&src->confirmed_mode, 0);
+    src->timing_frames = 0;
     /* Transform queues cache DMA-BUF imports beyond the last conversion.
      * Release every VIN borrower before freeing/reallocating its pool: an
      * old 4K pool pinned by previews can otherwise prevent even 1080p REQBUFS.
@@ -732,6 +798,8 @@ static int ax_capture_start(struct ax_source *src, uint32_t width, uint32_t heig
     unsigned int i;
 
     ax_capture_stop(src);
+    src->timing_frames = 0;
+    atomic_store(&src->confirmed_mode, 0);
     src->cap_fd = open(src->device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (src->cap_fd < 0) {
         ax_err_errno(error, error_cap, "open capture");
@@ -1102,6 +1170,7 @@ static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
             ax_err_errno(error, error_cap, "VIDIOC_QBUF");
         return -1;
     }
+    ax_observe_capture(src, &buf);
     /* Leave the buffer dequeued. The caller copies it, then ax_requeue. */
     src->held_index = buf.index;
     src->held = 1;
@@ -1141,6 +1210,7 @@ static int ax_latest_capture(struct ax_source *src, const uint8_t **data,
             ax_requeue(src);
             return -1;
         }
+        ax_observe_capture(src, &buf);
         ax_requeue(src);
         src->held = 1;
         src->held_index = buf.index;
@@ -1421,6 +1491,7 @@ static void ax_source_init(struct ax_source *src)
     atomic_init(&src->encoded_requested_ms, 0);
     atomic_init(&src->input_geometry, 0);
     atomic_init(&src->input_fps, 0);
+    atomic_init(&src->confirmed_mode, 0);
     pthread_mutex_init(&src->lock, NULL);
     pthread_mutex_init(&src->display_lock, NULL);
     pthread_mutex_init(&src->display_job_lock, NULL);
@@ -1544,7 +1615,13 @@ static int32_t ax_source_signal_present(void *source)
         return 0;
     /* Core polls signal state even without video consumers. Publish that
      * already-read bridge mode instead of leaving the last VIN size stale. */
-    ax_publish_input_mode(src, w, h, fps);
+    uint64_t confirmed = atomic_load_explicit(&src->confirmed_mode, memory_order_acquire);
+    if (src->streaming && confirmed) {
+        ax_publish_input_mode(src, confirmed >> 32, (confirmed >> 16) & 0xffff,
+                              confirmed & 0xffff);
+    } else if (!src->streaming) {
+        ax_publish_input_mode(src, w, h, fps);
+    }
     return 1;
 }
 
@@ -1601,12 +1678,14 @@ static int32_t ax_source_input_format(void *source, struct onekvm_video_format_v
 
     if (!src || !format || format->struct_size < ONEKVM_VIDEO_FORMAT_V1_BASE_SIZE)
         return -1;
+    uint64_t confirmed = atomic_load_explicit(&src->confirmed_mode, memory_order_acquire);
     geometry = atomic_load_explicit(&src->input_geometry, memory_order_acquire);
     if (!geometry)
         return -1;
-    format->width = (int32_t)(geometry >> 32);
-    format->height = (int32_t)(uint32_t)geometry;
-    format->fps = (int32_t)atomic_load_explicit(&src->input_fps, memory_order_relaxed);
+    format->width = confirmed ? (int32_t)(confirmed >> 32) : (int32_t)(geometry >> 32);
+    format->height = confirmed ? (int32_t)((confirmed >> 16) & 0xffff) : (int32_t)(uint32_t)geometry;
+    format->fps = confirmed ? (int32_t)(confirmed & 0xffff) :
+        (int32_t)atomic_load_explicit(&src->input_fps, memory_order_relaxed);
     format->pixel_format = ONEKVM_VIDEO_PIXEL_UNKNOWN;
     if (format->struct_size >= offsetof(struct onekvm_video_format_v1, flags) +
                                    sizeof(format->flags))
@@ -1903,7 +1982,7 @@ static int ax_bind_capture_locked(struct ax_encoder *enc, struct ax_source *src,
     enc->force_idr = 1;
     enc->pacer = (struct ax_pacer){0};
     fprintf(stderr, "ax630c: HDMI %s %ux%u @ %u, capture %ux%u stride %u, output %ux%u\n",
-            early ? "prearmed" : "locked", w, h, fps, src->width, src->height, src->bytesperline,
+            early ? "prearmed" : "configured", w, h, fps, src->width, src->height, src->bytesperline,
             output_w, output_h);
     return 0;
 }
@@ -1938,38 +2017,23 @@ static int32_t ax_encoder_bind_source(void *encoder, void *source,
         return ax_enter_placeholder(enc, src, error, error_cap);
     }
     enc->signal_loss_since_ms = 0;
-    ax_publish_input_mode(src, w, h, fps);
     pthread_mutex_lock(&src->lock);
-    if (enc->early_capture &&
-        (w != src->width || h != src->height) &&
-        w == enc->early_prev_w && h == enc->early_prev_h &&
-        now - enc->early_started_ms < 1000) {
-        /* Only the old published mode may linger after RX has switched. */
-        pthread_mutex_unlock(&src->lock);
-        return 0;
+    if (enc->early_capture && src->streaming) {
+        uint32_t rx_w, rx_h;
+        if (ax_rx_geometry(&rx_w, &rx_h) == 0 &&
+            rx_w == src->width && rx_h == src->height) {
+            /* Firmware CSI metadata may remain stale indefinitely. Keep a
+             * real-frame-validated RX mode instead of reverting after 1 s. */
+            pthread_mutex_unlock(&src->lock);
+            return 0;
+        }
+        enc->early_capture = 0;
     }
     if (enc->bound == src && src->streaming && enc->have_geom &&
         src->width == w && src->height == h) {
-        src->fps = fps;
+        if (!atomic_load(&src->confirmed_mode)) src->fps = fps;
         enc->bound_w = w;
         enc->bound_h = h;
-        if (enc->early_capture) {
-            if (enc->early_frame_seen) {
-                enc->early_capture = 0;
-            } else {
-                /* A published mode with no VIN frame needs a fresh DMA ring.
-                 * The RX size alone can precede usable CSI on some modes. */
-                fprintf(stderr, "ax630c: prearmed VIN stalled at %ux%u, restarting DMA ring\n",
-                        w, h);
-                if (ax_capture_start(src, w, h, error, error_cap) != 0) {
-                    pthread_mutex_unlock(&src->lock);
-                    return -1;
-                }
-                ax_import_capture(src, enc->venc_fd);
-                enc->force_idr = 1;
-                enc->early_capture = 0;
-            }
-        }
         pthread_mutex_unlock(&src->lock);
         return 0;
     }
@@ -2061,19 +2125,24 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
     rc = ax_grab_frame(src, &frame, &stride, error, error_cap);
     if (rc == 2 && src->width >= 64 && src->height >= 64) {
         uint32_t mode_w, mode_h, mode_fps;
-        uint32_t rx_w, rx_h;
+		uint32_t rx_w, rx_h;
         int rx_probe = ax_confirm_new_rx_geometry(enc, src, &rx_w, &rx_h);
 
-        if (rx_probe == 0) {
+        if (rx_probe == 0 && ax_recovery_due(src, ax_now_ms())) {
             /* RX geometry is only a candidate. Keep waiting for a real VIN
              * frame; a successful STREAMON alone is not signal proof. */
-            if (ax_bind_capture_locked(enc, src, rx_w, rx_h,
-                                       src->fps ? src->fps : 60, 1,
+			if (ax_bind_capture_locked(enc, src, rx_w, rx_h, 60, 1,
                                        error, error_cap) == 0)
                 rc = ax_grab_frame(src, &frame, &stride, error, error_cap);
             else
                 rc = -1;
-        } else if (enc->early_capture || rx_probe == 1) {
+        } else if (enc->early_capture || rx_probe == 1 || rx_probe == 0) {
+            if (enc->early_capture && ax_recovery_due(src, ax_now_ms())) {
+                if (ax_capture_start(src, src->width, src->height, error, error_cap) == 0) {
+                    ax_import_capture(src, enc->venc_fd);
+                    enc->force_idr = 1;
+                }
+            }
             /* Do not tear down the newly armed or soon-to-change DMA ring. */
         } else {
             /* A missing HDMI mode is handled by the placeholder after the
@@ -2087,7 +2156,7 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
                         return -1;
                     pthread_mutex_lock(&src->lock);
                     rc = ax_grab_frame(src, &frame, &stride, error, error_cap);
-                } else {
+                } else if (ax_recovery_due(src, ax_now_ms())) {
                     fprintf(stderr, "ax630c: capture stalled, restarting DMA ring\n");
                     if (ax_capture_start(src, src->width, src->height, error, error_cap) == 0) {
                         ax_import_capture(src, enc->venc_fd);
