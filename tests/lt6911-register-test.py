@@ -12,13 +12,14 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-driver = root / 'linux-6.18-ax620e/drivers/misc/lt6911.c'
+driver = Path(os.environ.get('ONEKVM_LT6911_DRIVER',
+    root / 'linux-6.18-ax620e/drivers/misc/lt6911.c'))
 source = driver.read_text()
 names = '''lt6911_write lt6911_read lt6911_read_be16 lt6911_write_block
 lt6911_read_block lt6911_write_sys_seq lt6911_enable lt6911_disable
 lt6911_disable_watchdog lt6911_chip_name lt6911_check_chip_id
 lt6911_set_power lt6911_power_cycle lt6911_get_rx_geometry lt6911_get_signal_state lt6911_get_res lt6911_get_fps
-lt6911uxc_shadow_payload lt6911uxc_shadow_restore lt6911uxc_shadow_apply
+lt6911uxc_shadow_payload lt6911uxc_shadow_restore lt6911uxc_shadow_apply lt6911uxc_seed_snapshot
 lt6911c_flash_end lt6911c_flash_address lt6911c_flash_read lt6911c_flash_ack
 lt6911c_flash_prepare lt6911c_flash_erase lt6911c_flash_write_page
 lt6911c_edid_read lt6911c_edid_write lt6911_check_edid
@@ -71,7 +72,7 @@ static void usleep_range(unsigned lo, unsigned hi) { (void)lo; (void)hi; }
 struct mock_text { char value[64]; };
 struct lt6911 {
     void *client, *dev, *pwr_gpio; int chip, buf_lock;
-    bool powered, shadow_override, shadow_restore_pending;
+    bool powered, shadow_supported, shadow_override, shadow_restore_pending;
     u8 shadow_desired[256], edid_snapshot[256];
     size_t edid_snapshot_len;
     struct mock_text power;
@@ -87,7 +88,7 @@ static void lt6911_set_text(struct mock_text *text, const char *fmt, ...) {
     va_end(ap);
 }
 static u8 regs[256][256], flash[0x20000], bank, fifo[32];
-static unsigned fifo_len, calls, fail_at, erases, programs, short_block;
+static unsigned fifo_len, calls, fail_at, fail_at2, erases, programs, short_block;
 static unsigned c_reads, unstable_read, erase_size = 4096, bad_program;
 static int alloc_failure;
 static unsigned erase_call, program_call;
@@ -116,14 +117,20 @@ static int gpiod_set_value_cansleep(void *gpio, bool on) {
     if (uxc_flash_mode && on) memcpy(shadow, flash + 0x18000, 256);
     return 0;
 }
-static int bus_fault(void) { return ++calls == fail_at ? -EIO : 0; }
+static int bus_fault(void) {
+    ++calls;
+    if (calls == fail_at) return -EIO;
+    if (calls == fail_at2) return -EREMOTEIO;
+    return 0;
+}
 static unsigned address(void) {
     return ((unsigned)regs[bank][0x5b] << 16) |
            ((unsigned)regs[bank][0x5c] << 8) | regs[bank][0x5d];
 }
 static int i2c_smbus_write_byte_data(void *client, u8 reg, u8 value) {
     (void)client;
-    if (bus_fault()) return -EIO;
+    int ret = bus_fault();
+    if (ret) return ret;
     if (reg == 0xff) { bank = value; return 0; }
     if (shadow_mode) {
         assert((bank == 0x80 && (reg == 0xee || reg == 0x10)) ||
@@ -180,13 +187,15 @@ static int i2c_smbus_write_byte_data(void *client, u8 reg, u8 value) {
 }
 static int i2c_smbus_read_byte_data(void *client, u8 reg) {
     (void)client;
-    if (bus_fault()) return -EIO;
+    int ret = bus_fault();
+    if (ret) return ret;
     if (shadow_mode && bank == 0xb0 && reg == 0xb0) return shadow[regs[bank][0x0a]];
     return regs[bank][reg];
 }
 static int i2c_smbus_write_i2c_block_data(void *client, u8 reg, u8 len, const u8 *data) {
     (void)client;
-    if (bus_fault()) return -EIO;
+    int ret = bus_fault();
+    if (ret) return ret;
     assert((bank == 0xe0 || bank == 0x80) && reg == 0x59 && len <= sizeof(fifo));
     memcpy(fifo, data, len);
     fifo_len = len;
@@ -194,7 +203,8 @@ static int i2c_smbus_write_i2c_block_data(void *client, u8 reg, u8 len, const u8
 }
 static int i2c_smbus_read_i2c_block_data(void *client, u8 reg, u8 len, u8 *data) {
     (void)client;
-    if (bus_fault()) return -EIO;
+    int ret = bus_fault();
+    if (ret) return ret;
     assert((bank == 0xe0 || bank == 0x80) && reg == 0x5f);
     assert(address() + len <= sizeof(flash));
     memcpy(data, flash + address(), len);
@@ -207,7 +217,7 @@ tests = r'''
 static void reset(void) {
     memset(regs, 0, sizeof(regs));
     memset(flash, 0xff, sizeof(flash));
-    bank = fifo_len = calls = fail_at = erases = programs = short_block = 0;
+    bank = fifo_len = calls = fail_at = fail_at2 = erases = programs = short_block = 0;
     c_reads = unstable_read = bad_program = alloc_failure = 0;
     erase_call = program_call = shadow_mode = shadow_writes = corrupt_shadow = 0;
     uxc_flash_mode = power_switches = gpio_fault = 0;
@@ -282,10 +292,11 @@ int main(void) {
     reset(); lt.chip = LT6911_CHIP_D;
     memcpy(flash + 0x8100, version, sizeof(version));
     assert(!lt6911_edid_write(&lt, edid));
-    assert(erases == 1 && programs == 9);
+    assert(erases == 1 && programs == 9 && regs[0xe0][0xee] == 0);
     assert(!memcmp(flash + 0x8000, edid, sizeof(edid)));
     assert(!memcmp(flash + 0x8100, version, sizeof(version)));
     assert(!lt6911_edid_read(&lt, readback) && !memcmp(readback, edid, sizeof(edid)));
+    assert(regs[0xe0][0xee] == 0);
     assert(!lt6911_version_read(&lt, text) && !strcmp(text, "NanoKVM_Pro (Desk-H) NebF10022"));
     assert(lt6911_version_write(&lt, version, sizeof(version)) == -EIO && erases == 1);
     memset(flash + 0x8100, 0xff, 32);
@@ -293,6 +304,7 @@ int main(void) {
     assert(!memcmp(flash + 0x8000, edid, 256));
     short_block = 1;
     assert(lt6911_edid_read(&lt, readback) == -EIO);
+    assert(regs[0xe0][0xee] == 0);
     short_block = 0;
 
     /* Every failed transaction in the read path must return an error,
@@ -305,7 +317,59 @@ int main(void) {
         calls = 0; fail_at = n;
         assert(lt6911_edid_read(&lt, readback) < 0);
         assert(!memcmp(flash, saved_flash, sizeof(flash)));
+        /* Only failure of the final EE bank/value transfer can leave it open. */
+        assert(regs[0xe0][0xee] == (n >= read_calls - 1));
     }
+
+    /* Isolate each cleanup transfer, including bank-select failures. Earlier
+     * failures must still reach EE, and cleanup must return the first error. */
+    for (unsigned n = 0; n <= 8; n++) {
+        reset(); regs[0xe0][0xee] = 1;
+        regs[0xe0][0x5a] = regs[0xe0][0x58] = 0x21;
+        fail_at = n;
+        assert(lt6911d_flash_end(&lt) == (n ? -EIO : 0));
+        assert(calls == (n && n % 2 ? 7 : 8));
+        assert(regs[0xe0][0xee] == (n >= 7));
+        if (n != 3 && n != 4) assert(regs[0xe0][0x5a] == 0);
+        if (n != 5 && n != 6) assert(regs[0xe0][0x58] == 0);
+    }
+    reset(); regs[0xe0][0xee] = 1; fail_at = 1; fail_at2 = 3;
+    assert(lt6911d_flash_end(&lt) == -EIO && regs[0xe0][0xee] == 0);
+    reset(); fail_at = 3; fail_at2 = 6;
+    assert(lt6911d_flash_read(&lt, 0x80, readback, 256) == -EIO);
+    assert(regs[0xe0][0xee] == 0 && calls == 10);
+    /* The caller must propagate a cleanup-only failure without retrying. */
+    reset(); fail_at2 = read_calls - 7;
+    assert(lt6911d_flash_read(&lt, 0x80, readback, 256) == -EREMOTEIO);
+    assert(regs[0xe0][0xee] == 0 && calls == read_calls - 1);
+
+    /* Every write/verification transfer must return its error. EE is closed
+     * unless its own final transfer fails; firmware outside metadata survives. */
+    reset();
+    assert(!lt6911d_flash_read(&lt, 0x81, readback, sizeof(version)));
+    unsigned d_version_read_calls = calls;
+    reset();
+    assert(!lt6911d_write_metadata(&lt, edid, version));
+    assert(regs[0xe0][0xee] == 0);
+    unsigned d_write_calls = calls;
+    unsigned d_write_end = d_write_calls - d_version_read_calls;
+    for (unsigned n = 1; n <= d_write_calls; n++) {
+        reset(); fail_at = n;
+        assert(lt6911d_write_metadata(&lt, edid, version) == -EIO);
+        bool close_failed = n == d_write_end - 1 || n == d_write_end ||
+                            n == d_write_calls - 1 || n == d_write_calls;
+        assert(regs[0xe0][0xee] == close_failed);
+        assert(!memchr_inv(flash, 0xff, 0x8000));
+        assert(!memchr_inv(flash + 0x8120, 0xff, sizeof(flash) - 0x8120));
+        if (n > d_write_end - 8 && n <= d_write_end)
+            assert(calls <= d_write_end); /* No verify after failed cleanup. */
+    }
+    reset(); fail_at = 3; fail_at2 = 6;
+    assert(lt6911d_write_metadata(&lt, edid, version) == -EIO);
+    assert(regs[0xe0][0xee] == 0 && !erases && !programs);
+    printf("D cleanup: 8 cleanup, %u read and %u write fault points; primary error preserved\n",
+           read_calls, d_write_calls);
+
     /* Valid C fixture with two blocks, and a distinct valid replacement. */
     u8 original[256] = {0,255,255,255,255,255,255,0};
     original[126] = 1; original[127] = 5; /* header sums to 250 */
@@ -444,6 +508,15 @@ int main(void) {
     memcpy(saved_flash, flash, sizeof(flash));
     assert(!lt6911uxc_shadow_apply(&lt, NULL, readback));
     assert(!memcmp(readback, original, 256) && !shadow_writes && regs[0x80][0x10] == 5);
+    assert(!lt6911uxc_seed_snapshot(&lt) && lt.shadow_supported);
+    assert(lt.edid_snapshot_len == 256 && !memcmp(lt.edid_snapshot, original, 256));
+    calls = 0; fail_at = 1;
+    assert(lt6911uxc_seed_snapshot(&lt) < 0 && !lt.shadow_supported);
+    assert(lt.edid_snapshot_len == 256 && !memcmp(lt.edid_snapshot, original, 256));
+    fail_at = 0; regs[0xb0][0x0b] &= ~4;
+    assert(lt6911uxc_seed_snapshot(&lt) == -EOPNOTSUPP && !lt.shadow_supported);
+    assert(lt.edid_snapshot_len == 256 && !memcmp(lt.edid_snapshot, original, 256));
+    regs[0xb0][0x0b] |= 4;
     assert(!lt6911uxc_shadow_apply(&lt, original, readback) && !shadow_writes);
     calls = 0;
     assert(!lt6911uxc_shadow_apply(&lt, edid, readback));

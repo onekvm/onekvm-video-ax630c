@@ -10,6 +10,7 @@ LDFLAGS := -shared -pthread
 
 test-lt6911:
 	python3 tests/lt6911-register-test.py
+	python3 tests/lt6911-proc-test.py
 
 all: host
 
