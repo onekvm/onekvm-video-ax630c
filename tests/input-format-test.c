@@ -6,6 +6,7 @@
 static const char *mode_width = "1920\n", *mode_height = "1080\n";
 static const char *mode_fps = "60\n", *mode_status = "stable\n";
 static unsigned reads;
+static const char *capture_device;
 
 FILE *__wrap_fopen(const char *path, const char *mode)
 {
@@ -24,9 +25,49 @@ FILE *__wrap_fopen(const char *path, const char *mode)
 
 int __wrap_open(const char *path, int flags, ...)
 {
-    (void)path; (void)flags;
+    if (capture_device) {
+        assert(strcmp(path, capture_device) == 0);
+        assert(flags & O_NONBLOCK);
+        errno = ENOENT;
+        return -1;
+    }
     assert(!"input metadata must never open a capture/encoder device");
     return -1;
+}
+
+static void expect_capture_device(struct ax_source *src, const char *device)
+{
+    char error[128];
+    capture_device = device;
+    /* Observe the actual open path without touching a capture device. */
+    assert(ax_capture_start(src, 1920, 1080, error, sizeof(error)) == -1);
+    assert(strstr(error, "open capture") != NULL);
+    assert(src->cap_fd == -1 && !src->streaming);
+    capture_device = NULL;
+}
+
+static void check_capture_devices(void)
+{
+    static const struct { const char *config, *expected; } devices[] = {
+        {"/dev/video0", "/dev/onekvm-vin"},
+        {"/dev/onekvm-vin", "/dev/onekvm-vin"},
+        {"/dev/video7", "/dev/video7"},
+    };
+    for (unsigned i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        struct onekvm_video_source_config_v1 config = {
+            .struct_size = sizeof(config), .device = devices[i].config,
+        };
+        char error[128];
+        void *source = NULL;
+        assert(ax_source_create(&config, &source, error, sizeof(error)) == 0);
+        expect_capture_device(source, devices[i].expected);
+        for (unsigned j = 0; j < sizeof(devices) / sizeof(devices[0]); j++) {
+            config.device = devices[j].config;
+            assert(ax_source_reset(source, &config, error, sizeof(error)) == 0);
+            expect_capture_device(source, devices[j].expected);
+        }
+        ax_source_destroy(source);
+    }
 }
 
 static void expect_format(struct ax_source *src, int width, int height, int fps)
@@ -44,6 +85,7 @@ static void expect_format(struct ax_source *src, int width, int height, int fps)
 
 int main(void)
 {
+    check_capture_devices();
     struct ax_source src;
     ax_source_init(&src);
     struct onekvm_video_format_v1 format = {.struct_size = sizeof(format)};

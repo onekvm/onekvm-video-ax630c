@@ -50,7 +50,7 @@
 #include "ax_pacing.h"
 
 #define AX_DRIVER_ID "ax630c"
-#define AX_CAP_DEV "/dev/video0"
+#define AX_CAP_DEV "/dev/onekvm-vin"
 /* Power-of-two, matching the capture carveout's DMA bitmap slots. */
 #define AX_MAX_BUFS 8
 /* Parameter sets precede the slice in the fixed encoder output region.
@@ -1439,6 +1439,13 @@ static void ax_source_init(struct ax_source *src)
     atomic_init(&src->display_attempted_ms, 0);
 }
 
+static const char *ax_capture_device(const char *device)
+{
+    /* Modular probe order can assign video0 to TDP or VDEC. Keep legacy
+     * configurations on the VIN alias across both creation and reset. */
+    return strcmp(device, "/dev/video0") == 0 ? AX_CAP_DEV : device;
+}
+
 static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *config,
                                 void **source, char *error, uint32_t error_cap)
 {
@@ -1454,7 +1461,8 @@ static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *conf
         return -1;
     }
     ax_source_init(src);
-    snprintf(src->device, sizeof(src->device), "%s", config->device);
+    snprintf(src->device, sizeof(src->device), "%s",
+             ax_capture_device(config->device));
     src->output_resolution = config->resolution;
     uint32_t w, h, fps;
     if (ax_hdmi_mode(&w, &h, &fps) == 0)
@@ -1503,7 +1511,8 @@ static int32_t ax_source_reset(void *source,
     }
     pthread_mutex_lock(&src->lock);
     ax_capture_stop(src);
-    snprintf(src->device, sizeof(src->device), "%s", config->device);
+    snprintf(src->device, sizeof(src->device), "%s",
+             ax_capture_device(config->device));
     src->output_resolution = config->resolution;
     atomic_store(&src->interrupted, 0);
     atomic_store(&src->encoded_requested_ms, 0);

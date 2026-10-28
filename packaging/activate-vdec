@@ -1,16 +1,40 @@
 #!/bin/sh
 set -eu
+# An old alias may now refer to a different, still-valid character device.
+# Clear all aliases before probing, including when a module fails to load.
+rm -f /dev/onekvm-vin /dev/onekvm-vproc /dev/onekvm-vdec /dev/onekvm-vdec-media
+
+# Publish only a node found in the current platform topology. An existing
+# alias (including one created by udev) is not evidence that probe succeeded.
+link_node() {
+    alias=$1
+    expected_name=$2
+    shift 2
+    for node do
+        test -d "$node" || continue
+        if test -n "$expected_name"; then
+            test -f "$node/name" || continue
+            test "$(cat "$node/name")" = "$expected_name" || continue
+        fi
+        target="/dev/${node##*/}"
+        test -c "$target"
+        chmod 0600 "$target"
+        ln -sfn "$target" "$alias"
+        return 0
+    done
+    echo "OneKVM video device not registered: $alias" >&2
+    return 1
+}
+
+# Media module probe order does not guarantee /dev/video0 is VIN. Resolve
+# capture by its platform device before starting any video consumer.
+modprobe -a lt6911 open_vin_csi2 open_vin_capture ax630c_venc_vcmd
+link_node /dev/onekvm-vin open_vin_capture /sys/bus/platform/devices/*/video4linux/video*
 # Shared scaler/CSC alias: VIN and VDEC use this standard V4L2 mem2mem device.
 modprobe ax630c_tdp
-for node in /sys/bus/platform/devices/4405000.image-processor/video4linux/video*; do
-    test -d "$node" || continue
-    target="/dev/${node##*/}"
-    test -c "$target"
-    chmod 0600 "$target"
-    ln -sfn "$target" /dev/onekvm-vproc
-done
-test -c /dev/onekvm-vproc
-test -c /dev/onekvm-vdec && test -c /dev/onekvm-vdec-media && exit 0
+link_node /dev/onekvm-vproc ax630c-tdp /sys/bus/platform/devices/4405000.image-processor/video4linux/video*
+# A stale alias can still point to a valid but different device after reload.
+# Always refresh decoder aliases from the platform topology as well.
 device=/sys/bus/platform/devices/4020000.vdec
 test -d "$device" || exit 0
 modprobe hantro-vpu
@@ -32,18 +56,5 @@ if ! test -d "$device/video4linux"; then
 fi
 # Coldplug-only udev images do not keep a daemon alive. The rules handle
 # normal hotplug; also establish aliases directly after this explicit bind.
-for node in "$device"/video4linux/video*; do
-    test -d "$node" || continue
-    target="/dev/${node##*/}"
-    test -c "$target"
-    chmod 0600 "$target"
-    ln -sfn "$target" /dev/onekvm-vdec
-done
-for node in "$device"/media*; do
-    test -d "$node" || continue
-    target="/dev/${node##*/}"
-    test -c "$target"
-    chmod 0600 "$target"
-    ln -sfn "$target" /dev/onekvm-vdec-media
-done
-test -c /dev/onekvm-vdec && test -c /dev/onekvm-vdec-media
+link_node /dev/onekvm-vdec '' "$device"/video4linux/video*
+link_node /dev/onekvm-vdec-media '' "$device"/media*

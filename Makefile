@@ -94,6 +94,7 @@ build/hevc-header-test: tests/hevc-header-test.c third_party/vcenc-ewl/vcenc_hev
 	$(CC) -O2 -Wall $(INC) -o $@ tests/hevc-header-test.c
 
 smoke: host
+	python3 tests/device-alias-test.py
 	./build/edid-quiesce-test
 	./build/abi-smoke ./build/ax630c.so
 	./build/input-format-test
