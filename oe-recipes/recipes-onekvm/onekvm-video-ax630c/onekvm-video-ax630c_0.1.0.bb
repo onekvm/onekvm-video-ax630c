@@ -57,6 +57,8 @@ do_compile() {
         ${S}/tests/snapshot-conversion-test.c ${S}/src/ax_snapshot.c -lm -ljpeg
     ${CC} ${CFLAGS} ${LDFLAGS} -I${B}/include -I/sources/onekvm-core/include \
         -o ${B}/ax630c-vdec-test ${S}/tests/vdec-abi-test.c -ldl -pthread
+    ${CC} ${CFLAGS} ${LDFLAGS} -fPIC -shared -I${S}/third_party/vcenc-ewl \
+        -o ${B}/ax630c-schedule-trace.so ${S}/tools/ax630c-schedule-trace.c -ldl -pthread
 }
 
 do_install() {
@@ -76,13 +78,14 @@ do_install() {
     install -m 0755 ${B}/ax630c-tdp-test ${D}${libexecdir}/onekvm/ax630c-tdp-test
     install -m 0755 ${B}/ax630c-snapshot-conversion-test ${D}${libexecdir}/onekvm/ax630c-snapshot-conversion-test
     install -m 0755 ${B}/ax630c-vdec-test ${D}${libexecdir}/onekvm/ax630c-vdec-test
+    install -m 0755 ${B}/ax630c-schedule-trace.so ${D}${libexecdir}/onekvm/ax630c-schedule-trace.so
 }
 
 SOLIBS = ".so"
 FILES_SOLIBSDEV = ""
 FILES:${PN} = "${systemd_system_unitdir}/onekvm.service.d/20-ax630c-software-srtp.conf ${libdir}/onekvm/video-backends/ax630c.so ${datadir}/onekvm/device-backends/ax630c.json ${libexecdir}/onekvm/activate-vdec ${systemd_system_unitdir}/onekvm-vdec.service ${nonarch_base_libdir}/udev/rules.d/70-onekvm-vdec.rules"
 PACKAGES =+ "${PN}-diag"
-FILES:${PN}-diag = "${libexecdir}/onekvm/ax630c-once ${libexecdir}/onekvm/ax630c-eip130-ioctl-test ${libexecdir}/onekvm/ax630c-tdp-test ${libexecdir}/onekvm/ax630c-vdec-test ${libexecdir}/onekvm/ax630c-snapshot-conversion-test"
+FILES:${PN}-diag = "${libexecdir}/onekvm/ax630c-once ${libexecdir}/onekvm/ax630c-eip130-ioctl-test ${libexecdir}/onekvm/ax630c-tdp-test ${libexecdir}/onekvm/ax630c-vdec-test ${libexecdir}/onekvm/ax630c-snapshot-conversion-test ${libexecdir}/onekvm/ax630c-schedule-trace.so"
 INSANE_SKIP:${PN} += "dev-so"
 RPROVIDES:${PN} += "onekvm-video-backend"
 RDEPENDS:${PN} += "kernel-module-lt6911 kernel-module-open-vin-csi2 kernel-module-open-vin-capture kernel-module-ax630c-venc-vcmd kernel-module-ax630c-tdp"

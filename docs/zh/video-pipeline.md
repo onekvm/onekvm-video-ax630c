@@ -132,6 +132,40 @@ BT.709；查询值与 SPS/VUI 生成器共用配置常量，不从 HDMI 输入�
 中断的精确发生时刻。浏览器按实际 RTP 时间戳匹配完整帧收包时间，校时估算、
 误差与缺失数据语义见 [`Core WebRTC 延迟规范`](../../../onekvm-core/docs/webrtc-low-latency.md#编码到收帧)。
 
+## 采集与编码调度诊断
+
+`onekvm-video-ax630c-diag` 提供 `ax630c-schedule-trace.so`，只在开发测试中通过
+`LD_PRELOAD` 挂到现有 Core 进程；不创建采集或编码消费者，不改变帧队列。
+它按线程关联最近一张带单调时间戳的 VIN 帧和后续 VCMD 提交／等待，输出
+`ax-schedule:` 日志，单位均为微秒：
+
+| 字段 | 测量边界 |
+| --- | --- |
+| `age_us` | VIN 帧完成时间戳到成功 DQBUF 返回 |
+| `submit_us` | 最近一次成功 DQBUF 返回到进入 LINK_RUN ioctl |
+| `prepare_us` | 进入 RESERVE ioctl 到进入 LINK_RUN ioctl，包含命令准备和 DMA 写入 |
+| `wait_us` | WAIT ioctl 的调用耗时，包含硬件等待和线程唤醒 |
+| `complete_us` | VIN 帧完成时间戳到 WAIT ioctl 返回 |
+
+诊断必须有实际编码消费者；登录、状态查询和仅小屏预览不足以触发编码。
+无信号占位没有新的 VIN 帧时间戳，不输出伪造的采集样本。VIN 时间戳来自驱动
+完成帧时的 `ktime_get_ns()`，不包含此前的 HDMI 扫描、桥片和 DMA 写帧时间。
+这些字段也不包含 Core 出包、网络、解码或最终显示，不能当作端到端延迟。
+`prepare_us` 与 `submit_us` 可能重叠，不直接相加。
+
+在测试窗口内给 `onekvm.service` 添加临时运行时 drop-in，设置：
+
+```ini
+[Service]
+Environment=LD_PRELOAD=/usr/libexec/onekvm/ax630c-schedule-trace.so
+```
+
+执行 `systemctl daemon-reload` 并重启 `onekvm.service` 后采样日志；结束后移除
+本次 drop-in，再执行相同的 reload／restart 撤销插桩。启用前核对是否已有
+`LD_PRELOAD` 设置，不能覆盖其他诊断任务。插桩自身增加计时和日志开销，比较时
+两侧应使用相同插桩、输入模式、编码、码率和消费者，并用回退对照区分时序收益
+与负载波动。不把缩短 `poll()` 等待或移走少量 CPU 工作直接当作画面延迟降低。
+
 ## HTTP JPEG 截图
 
 后端声明 `SOURCE_SNAPSHOT`，供 `GET /api/stream` 的 `Accept: image/jpeg`

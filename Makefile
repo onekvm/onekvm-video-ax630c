@@ -14,10 +14,13 @@ test-lt6911:
 
 all: host
 
-host: build/edid-quiesce-test build/ax630c.so build/abi-smoke build/no-signal-test build/display-test build/display-capture-test build/hevc-header-test build/edid-test build/rate-control-test build/vcenc-rc-test build/snapshot-test build/pacing-capture-test build/encoder-buffer-test build/snapshot-conversion-test build/tdp-cache-test build/input-format-test build/capture-teardown-test
+host: build/edid-quiesce-test build/ax630c.so build/abi-smoke build/no-signal-test build/display-test build/display-capture-test build/hevc-header-test build/edid-test build/rate-control-test build/vcenc-rc-test build/snapshot-test build/pacing-capture-test build/encoder-buffer-test build/snapshot-conversion-test build/tdp-cache-test build/input-format-test build/capture-teardown-test build/ax630c-schedule-trace.so
 
 build:
 	mkdir -p build
+
+build/ax630c-schedule-trace.so: tools/ax630c-schedule-trace.c third_party/vcenc-ewl/vcmd_abi.h | build
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -ldl
 
 build/include/linux/axera_eip130.h: ../linux-6.18-ax620e/include/uapi/linux/axera_eip130.h | build
 	mkdir -p build/include/linux
