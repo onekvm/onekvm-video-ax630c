@@ -31,7 +31,7 @@ TRANSFORM := ../onekvm-generic-v4l2/src/v4l2_transform.c
 build/tdp-v4l2-test: tests/tdp-v4l2-test.c $(TRANSFORM) | build
 	$(CC) -O2 -Wall -Wextra $(INC) -o $@ $^
 
-build/ax630c.so: Makefile $(TRANSFORM) src/ax630c_video.c src/ax_pacing.h src/ax_rate.c src/ax_rate.h src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_snapshot.c src/ax_snapshot.h src/ax_tdp.h src/ax_display.h src/no_signal_frames.inc $(wildcard third_party/vcenc-ewl/*.h) ../onekvm-core/include/onekvm/video_backend_v1.h | build
+build/ax630c.so: Makefile $(TRANSFORM) src/ax630c_video.c src/ax_pacing.h src/ax_rate.c src/ax_rate.h src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_snapshot.c src/ax_snapshot.h src/ax_tdp.h src/ax_display.h $(wildcard third_party/vcenc-ewl/*.h) ../onekvm-core/include/onekvm/video_backend_v1.h | build
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ src/ax630c_video.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_snapshot.c $(TRANSFORM) -lm $(JPEG_LIBS)
 
 build/abi-smoke: tests/abi-smoke.c build/ax630c.so | build
@@ -52,7 +52,7 @@ crypto-check: build/crypto-abi-test build/crypto-mock.so
 build/eip130-ioctl-test: tests/eip130-ioctl-test.c build/include/linux/axera_eip130.h | build
 	$(CC) -O2 -Wall -Wextra $(INC) -o $@ tests/eip130-ioctl-test.c -pthread
 
-build/no-signal-test: tests/no-signal-test.c src/ax_no_signal.c src/ax_display.c src/ax_display.h src/no_signal_frames.inc | build
+build/no-signal-test: tests/no-signal-test.c src/ax_no_signal.c src/ax_no_signal.h | build
 	$(CC) -O2 -Wall -Wextra -o $@ tests/no-signal-test.c src/ax_no_signal.c
 
 build/display-test: tests/display-test.c src/ax_display.c src/ax_display.h | build

@@ -173,6 +173,10 @@ struct ax_encoder {
     uint32_t early_prev_w;
     uint32_t early_prev_h;
     int placeholder;
+    uint64_t no_signal_device;
+    uint64_t no_signal_inode;
+    int64_t no_signal_mtime_sec;
+    int64_t no_signal_mtime_nsec;
     size_t packet_len;
     uint32_t packet_key;
     uint64_t packet_pts;
@@ -1893,17 +1897,26 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
                                 char *error, uint32_t error_cap)
 {
     uint32_t width, height;
+    struct ax_no_signal_token token;
+    int refresh;
 
     pthread_mutex_lock(&src->lock);
-    if (enc->placeholder && enc->bound == src && enc->have_geom) {
-        pthread_mutex_unlock(&src->lock);
-        return 0;
-    }
     ax_output_size(src->output_resolution,
                    enc->have_geom ? enc->geom.w : AX_PLACEHOLDER_W,
                    enc->have_geom ? enc->geom.h : AX_PLACEHOLDER_H,
                    &width, &height);
-    ax_capture_stop(src);
+    ax_no_signal_token(width, height, &token);
+    refresh = enc->placeholder && enc->bound == src && enc->have_geom &&
+        enc->geom.w == width && enc->geom.h == height;
+    if (refresh && enc->no_signal_device == token.device &&
+        enc->no_signal_inode == token.inode &&
+        enc->no_signal_mtime_sec == token.mtime_sec &&
+        enc->no_signal_mtime_nsec == token.mtime_nsec) {
+        pthread_mutex_unlock(&src->lock);
+        return 0;
+    }
+    if (!refresh)
+        ax_capture_stop(src);
     if (!enc->have_geom || enc->geom.w != width || enc->geom.h != height) {
         if (ax_encoder_alloc_framebuf(enc, width, height, error, error_cap) != 0) {
             pthread_mutex_unlock(&src->lock);
@@ -1925,6 +1938,15 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
     src->display_seq++;
     pthread_cond_broadcast(&src->display_cv);
     pthread_mutex_unlock(&src->display_lock);
+    enc->no_signal_device = token.device;
+    enc->no_signal_inode = token.inode;
+    enc->no_signal_mtime_sec = token.mtime_sec;
+    enc->no_signal_mtime_nsec = token.mtime_nsec;
+    enc->force_idr = 1;
+    if (refresh) {
+        pthread_mutex_unlock(&src->lock);
+        return 0;
+    }
     enc->bound = src;
     enc->placeholder = 1;
     enc->early_capture = 0;
@@ -1932,7 +1954,6 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
     enc->last_placeholder_ms = 0;
     enc->pacer = (struct ax_pacer){0};
     enc->seq = 0;
-    enc->force_idr = 1;
     fprintf(stderr, "ax630c: no HDMI signal, encoding %ux%u placeholder\n",
             width, height);
     pthread_mutex_unlock(&src->lock);

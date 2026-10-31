@@ -326,7 +326,7 @@ LT6911UXC 在驱动 probe 时上电，不以网页会话为供电边界。SoC �
 
 ## 无信号占位
 
-无信号画面在后端编码，前端控制台不叠 Vue 占位图。画面资源来自 `onekvm-video-soph-mmf/src/no_signal_frames.inc`，同步复制到本目录的 `src/no_signal_frames.inc`；更新 MMF 已批准的 PNG 后必须重新同步该文件。`ax_no_signal.c` 把 packed NV21 解包并转为 VC8000E 输入所需的 YUYV，尺寸不匹配时等比留黑边。
+无信号画面在后端编码，前端控制台不叠 Vue 占位图。画面来自 `/data/onekvm/cache/no-signal/current/<宽>x<高>.nv21`，由语言包或自定义图片生成。文件不存在时输出黑帧。`ax_no_signal.c` 把 NV21 转为 VC8000E 输入所需的 YUYV，尺寸不匹配时等比留黑边。`current` 指向变化后重新绘制，并以 IDR 开始下一帧。
 
 首次绑定而 HDMI 未锁定时，后端分配默认 1920×1080 编码帧缓冲，把占位图写进其输入区，并以 5 fps 经正常 VC8000E 通道输出所选的 H.264 或 H.265。实时输入消失后，从首次检测到无信号起等待 3.2 秒，再停 VIN 并切换占位；即使 VIN 仍输出旧帧，也不能用这些帧重置无信号计时。105 的常规模式切换在此窗口内恢复，避免向浏览器连续发送占位与新尺寸两个 IDR、引起额外解码停顿。真实断信号实测从关闭 HDMI 到占位 IDR 约 4.5 秒。已知无 HDMI 时不得反复重建 DMA 环。两种画面切换时都重新从 IDR 开始，使 WebRTC 及录制端可解码。
 
