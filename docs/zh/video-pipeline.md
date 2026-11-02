@@ -19,8 +19,11 @@ LT7911EXC 的 EDID 支持 128–512 字节，长度须与扩展块数完全一�
 对 EXC 开放，LT7911D 不宣称写入能力，也不套用 LT6911UXC Shadow 协议。
 EXC 内核 writer 保留并校验 EDID 所在整个 64 KiB 擦除块的其他内容；安装和
 启动不自动写入 EDID。寄存器移植参考 Sipeed kernel
-`f0c18b62e4c4aca3638ca55bc0f359f9e724254f`，Flash 写入和 CSI lane 连线
-仍需 Go 实机验收。`make build/go-edid-test` 覆盖所有支持长度、截断读取、
+`f0c18b62e4c4aca3638ca55bc0f359f9e724254f`，Flash 写入仍需 Go 实机验收。
+原厂 `/proc/ax_proc/mipi_rx/attr` 报告四条数据 lane 为 `[0,1,3,4]`、
+clock lane 为 `[2,5]`，与新设备树的 clock lane 2 及 data lanes 0/1/3/4
+一致；这确认了原厂运行配置，新驱动实际采集仍待验收。
+`make build/go-edid-test` 覆盖所有支持长度、截断读取、
 I/O 错误和 D 型号拒写；原 Pro `build/edid-test` 继续独立回归。
 
 ## LT6911 型号与诊断
