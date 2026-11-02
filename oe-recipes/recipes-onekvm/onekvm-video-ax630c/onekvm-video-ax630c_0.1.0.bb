@@ -10,7 +10,7 @@ AXERA_BACKEND = "ax630c"
 AXERA_BACKEND:onekvm-nanokvm-go = "ax620q"
 AXERA_BOARD_CFLAGS = ""
 AXERA_BOARD_CFLAGS:onekvm-nanokvm-go = "-DAXERA_NANOKVM_GO"
-DEPENDS += "jpeg gstreamer1.0 gstreamer1.0-plugins-base"
+DEPENDS += "jpeg gstreamer1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-bad"
 inherit systemd pkgconfig
 SYSTEMD_SERVICE:${PN} = "onekvm-vdec.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
