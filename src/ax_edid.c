@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "ax_edid.h"
+#include "ax_platform.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -8,13 +9,19 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef AXERA_NANOKVM_GO
+#define EDID_BYTES 512u
+#define EDID_MIN_BYTES 128u
+#else
 #define EDID_BYTES 256u
-#define EDID_DEVICE "/proc/lt6911_info/edid"
-#define EDID_SHADOW "/proc/lt6911_info/edid_shadow"
+#define EDID_MIN_BYTES 256u
+#endif
+#define EDID_DEVICE AX_BRIDGE_PROC "/edid"
+#define EDID_SHADOW AX_BRIDGE_PROC "/edid_shadow"
 static pthread_mutex_t edid_update_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#define EDID_SNAPSHOT "/proc/lt6911_info/edid_snapshot"
-#define CHIP_ID_DEVICE "/proc/lt6911_info/chip_id"
+#define EDID_SNAPSHOT AX_BRIDGE_PROC "/edid_snapshot"
+#define CHIP_ID_DEVICE AX_BRIDGE_PROC "/chip_id"
 
 /* The driver serves the detected ID from memory; this never probes I2C. */
 static const char *bridge_chip(void)
@@ -39,6 +46,8 @@ static const char *bridge_chip(void)
     if (!strcmp(id, "lt6911uxc")) return "LT6911UXC";
     if (!strcmp(id, "lt6911d")) return "LT6911D";
     if (!strcmp(id, "lt6911c")) return "LT6911C";
+    if (!strcmp(id, "lt7911exc")) return "LT7911EXC";
+    if (!strcmp(id, "lt7911d")) return "LT7911D";
     return "LT6911";
 }
 
@@ -52,9 +61,10 @@ static int edid_error(char *error, uint32_t capacity, const char *message)
 static int valid_edid(const uint8_t *data, uint32_t size)
 {
     static const uint8_t header[] = {0, 255, 255, 255, 255, 255, 255, 0};
-    if (size != EDID_BYTES || memcmp(data, header, sizeof(header)) || data[126] != 1)
+    if (size < EDID_MIN_BYTES || size > EDID_BYTES || size % 128u ||
+        memcmp(data, header, sizeof(header)) || ((uint32_t)data[126] + 1u) * 128u != size)
         return 0;
-    for (unsigned block = 0; block < 2; block++) {
+    for (unsigned block = 0; block < size / 128u; block++) {
         uint8_t sum = 0;
         for (unsigned i = 0; i < 128; i++)
             sum += data[block * 128 + i];
@@ -76,12 +86,16 @@ static int read_snapshot(uint8_t *data)
         ssize_t n = read(fd, data + size, EDID_BYTES - size);
         if (n < 0 && errno == EINTR)
             continue;
-        if (n <= 0)
+        if (n < 0) {
+            close(fd);
+            return -1;
+        }
+        if (n == 0)
             break;
         size += (size_t)n;
     }
     close(fd);
-    return size == EDID_BYTES ? 0 : -1;
+    return size >= EDID_MIN_BYTES && size <= EDID_BYTES ? (int)size : -1;
 }
 
 static int bridge_flash_supported(const char *chip)
@@ -90,7 +104,7 @@ static int bridge_flash_supported(const char *chip)
         /* Blank is the firmware-default slot, not an EDID to show as active.
          * All reads are from RAM; writes recheck the whole erase envelope. */
         uint8_t cached[EDID_BYTES];
-        if (read_snapshot(cached))
+        if (read_snapshot(cached) != EDID_BYTES)
             return 0;
         if (valid_edid(cached, EDID_BYTES))
             return 1;
@@ -99,14 +113,15 @@ static int bridge_flash_supported(const char *chip)
                 return 0;
         return 1;
     }
-    return !strcmp(chip, "LT6911UXC") || !strcmp(chip, "LT6911D");
+    return !strcmp(chip, "LT6911UXC") || !strcmp(chip, "LT6911D") ||
+           !strcmp(chip, "LT7911EXC");
 }
 
 static int bridge_shadow_supported(const char *chip)
 {
     uint8_t cached[EDID_BYTES];
     return !strcmp(chip, "LT6911UXC") && access(EDID_SHADOW, W_OK) == 0 &&
-           read_snapshot(cached) == 0 && valid_edid(cached, EDID_BYTES);
+           read_snapshot(cached) == EDID_BYTES && valid_edid(cached, EDID_BYTES);
 }
 
 int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
@@ -126,8 +141,9 @@ int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
             caps->flags |= ONEKVM_VIDEO_EDID_CAP_TEMPORARY;
 #endif
     }
-    caps->min_bytes = caps->max_bytes = EDID_BYTES;
-    caps->board_id = "pro";
+    caps->min_bytes = EDID_MIN_BYTES;
+    caps->max_bytes = EDID_BYTES;
+    caps->board_id = AX_BOARD_ID;
     return 0;
 }
 
@@ -137,11 +153,13 @@ int32_t ax_edid_get(struct onekvm_video_edid_blob_v1 *edid,
     if (!edid || edid->struct_size < sizeof(*edid))
         return edid_error(error, capacity, "invalid EDID buffer");
     edid->size = 0;
-    if (read_snapshot(edid->data))
+    int received = read_snapshot(edid->data);
+    if (received < 0)
         return edid_error(error, capacity, "open or read HDMI EDID snapshot");
-    if (!valid_edid(edid->data, EDID_BYTES))
+    uint32_t size = ((uint32_t)edid->data[126] + 1u) * 128u;
+    if (size != (uint32_t)received || !valid_edid(edid->data, size))
         return edid_error(error, capacity, "HDMI EDID snapshot is incomplete or invalid");
-    edid->size = EDID_BYTES;
+    edid->size = size;
     return 0;
 }
 
@@ -153,7 +171,7 @@ static int32_t ax_edid_set_impl(const struct onekvm_video_edid_blob_v1 *edid,
         apply->struct_size < sizeof(*apply))
         return edid_error(error, capacity, "invalid EDID request");
     if (!valid_edid(edid->data, edid->size))
-        return edid_error(error, capacity, "EDID must contain two valid 128-byte blocks");
+        return edid_error(error, capacity, "EDID block count or checksum is invalid");
     const char *chip = bridge_chip();
     if (temporary && (!bridge_shadow_supported(chip)))
         return edid_error(error, capacity, "temporary EDID requires a UXC Shadow interface");
@@ -171,10 +189,10 @@ static int32_t ax_edid_set_impl(const struct onekvm_video_edid_blob_v1 *edid,
     if (fd < 0) goto out;
     ssize_t written;
     do {
-        written = write(fd, edid->data, EDID_BYTES);
+        written = write(fd, edid->data, edid->size);
     } while (written < 0 && errno == EINTR);
     int closed = close(fd);
-    if (written != EDID_BYTES || closed) goto out;
+    if (written != edid->size || closed) goto out;
     apply->apply_required = ONEKVM_VIDEO_EDID_APPLY_HOTPLUG;
     result = 0;
 out:

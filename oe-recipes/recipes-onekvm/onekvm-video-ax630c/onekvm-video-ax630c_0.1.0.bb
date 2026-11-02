@@ -1,11 +1,15 @@
 SUMMARY = "AX630C native HDMI capture and VC8000E video backend"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
-PR = "r13"
+PR = "r14"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
-COMPATIBLE_MACHINE = "^onekvm-nanokvm-pro$"
+COMPATIBLE_MACHINE = "^(onekvm-nanokvm-pro|onekvm-nanokvm-go)$"
 PACKAGE_ARCH = "${MACHINE_ARCH}"
+AXERA_BACKEND = "ax630c"
+AXERA_BACKEND:onekvm-nanokvm-go = "ax620q"
+AXERA_BOARD_CFLAGS = ""
+AXERA_BOARD_CFLAGS:onekvm-nanokvm-go = "-DAXERA_NANOKVM_GO"
 DEPENDS += "jpeg gstreamer1.0 gstreamer1.0-plugins-base"
 inherit systemd pkgconfig
 SYSTEMD_SERVICE:${PN} = "onekvm-vdec.service"
@@ -32,32 +36,32 @@ python __anonymous() {
 do_compile() {
     install -d ${B}/include/linux
     install -m 0644 ${AXERA_EIP130_UAPI} ${B}/include/linux/axera_eip130.h
-    ${CC} ${CFLAGS} ${LDFLAGS} -fPIC -fvisibility=hidden -shared -pthread \
+    ${CC} ${CFLAGS} ${AXERA_BOARD_CFLAGS} ${LDFLAGS} -fPIC -fvisibility=hidden -shared -pthread \
         $(pkg-config --cflags gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0) \
         -I${B}/include -I${S}/third_party/vcenc-ewl \
         -I/sources/onekvm-core/include \
         -I/sources/onekvm-generic-v4l2/include \
-        -o ${B}/ax630c.so \
+        -o ${B}/${AXERA_BACKEND}.so \
         ${S}/src/ax630c_video.c ${S}/src/ax_rate.c ${S}/src/ax_edid.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c ${S}/src/ax_tdp.c ${S}/src/ax_snapshot.c \
         ${S}/src/ax_vdec.c /sources/onekvm-generic-v4l2/src/v4l2_transform.c \
         $(pkg-config --libs gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0) -lm -ljpeg
-    ${CC} ${CFLAGS} ${LDFLAGS} -DAX630C_STANDALONE -pthread \
+    ${CC} ${CFLAGS} ${AXERA_BOARD_CFLAGS} ${LDFLAGS} -DAX630C_STANDALONE -pthread \
         -I${B}/include -I${S}/third_party/vcenc-ewl \
         -I/sources/onekvm-core/include \
         -I/sources/onekvm-generic-v4l2/include \
         -o ${B}/ax630c-once \
         ${S}/src/ax630c_video.c ${S}/src/ax_rate.c ${S}/src/ax_edid.c ${S}/src/ax_no_signal.c ${S}/src/ax_display.c ${S}/src/ax_tdp.c ${S}/src/ax_snapshot.c \
         /sources/onekvm-generic-v4l2/src/v4l2_transform.c -lm -ljpeg
-    ${CC} ${CFLAGS} ${LDFLAGS} -I${B}/include \
+    ${CC} ${CFLAGS} ${AXERA_BOARD_CFLAGS} ${LDFLAGS} -I${B}/include \
         -o ${B}/ax630c-eip130-ioctl-test ${S}/tests/eip130-ioctl-test.c -pthread
-    ${CC} ${CFLAGS} ${LDFLAGS} -I/sources/onekvm-generic-v4l2/include \
+    ${CC} ${CFLAGS} ${AXERA_BOARD_CFLAGS} ${LDFLAGS} -I/sources/onekvm-generic-v4l2/include \
         -o ${B}/ax630c-tdp-test ${S}/tests/tdp-v4l2-test.c \
         /sources/onekvm-generic-v4l2/src/v4l2_transform.c
-    ${CC} ${CFLAGS} ${LDFLAGS} -o ${B}/ax630c-snapshot-conversion-test \
+    ${CC} ${CFLAGS} ${AXERA_BOARD_CFLAGS} ${LDFLAGS} -o ${B}/ax630c-snapshot-conversion-test \
         ${S}/tests/snapshot-conversion-test.c ${S}/src/ax_snapshot.c -lm -ljpeg
-    ${CC} ${CFLAGS} ${LDFLAGS} -I${B}/include -I/sources/onekvm-core/include \
+    ${CC} ${CFLAGS} ${AXERA_BOARD_CFLAGS} ${LDFLAGS} -I${B}/include -I/sources/onekvm-core/include \
         -o ${B}/ax630c-vdec-test ${S}/tests/vdec-abi-test.c -ldl -pthread
-    ${CC} ${CFLAGS} ${LDFLAGS} -fPIC -shared -I${S}/third_party/vcenc-ewl \
+    ${CC} ${CFLAGS} ${AXERA_BOARD_CFLAGS} ${LDFLAGS} -fPIC -shared -I${S}/third_party/vcenc-ewl \
         -o ${B}/ax630c-schedule-trace.so ${S}/tools/ax630c-schedule-trace.c -ldl -pthread
 }
 
@@ -68,10 +72,10 @@ do_install() {
     install -Dm0644 ${S}/packaging/onekvm-vdec.service ${D}${systemd_system_unitdir}/onekvm-vdec.service
     install -Dm0644 ${S}/packaging/70-onekvm-vdec.rules ${D}${nonarch_base_libdir}/udev/rules.d/70-onekvm-vdec.rules
     install -d ${D}${libdir}/onekvm/video-backends
-    install -m 0755 ${B}/ax630c.so ${D}${libdir}/onekvm/video-backends/ax630c.so
+    install -m 0755 ${B}/${AXERA_BACKEND}.so ${D}${libdir}/onekvm/video-backends/${AXERA_BACKEND}.so
     install -d ${D}${datadir}/onekvm/device-backends
-    install -m 0644 ${S}/packaging/ax630c-device-backend.json \
-        ${D}${datadir}/onekvm/device-backends/ax630c.json
+    install -m 0644 ${S}/packaging/${AXERA_BACKEND}-device-backend.json \
+        ${D}${datadir}/onekvm/device-backends/${AXERA_BACKEND}.json
     install -d ${D}${libexecdir}/onekvm
     install -m 0755 ${B}/ax630c-once ${D}${libexecdir}/onekvm/ax630c-once
     install -m 0755 ${B}/ax630c-eip130-ioctl-test ${D}${libexecdir}/onekvm/ax630c-eip130-ioctl-test
@@ -83,10 +87,12 @@ do_install() {
 
 SOLIBS = ".so"
 FILES_SOLIBSDEV = ""
-FILES:${PN} = "${systemd_system_unitdir}/onekvm.service.d/20-ax630c-software-srtp.conf ${libdir}/onekvm/video-backends/ax630c.so ${datadir}/onekvm/device-backends/ax630c.json ${libexecdir}/onekvm/activate-vdec ${systemd_system_unitdir}/onekvm-vdec.service ${nonarch_base_libdir}/udev/rules.d/70-onekvm-vdec.rules"
+FILES:${PN} = "${systemd_system_unitdir}/onekvm.service.d/20-ax630c-software-srtp.conf ${libdir}/onekvm/video-backends/${AXERA_BACKEND}.so ${datadir}/onekvm/device-backends/${AXERA_BACKEND}.json ${libexecdir}/onekvm/activate-vdec ${systemd_system_unitdir}/onekvm-vdec.service ${nonarch_base_libdir}/udev/rules.d/70-onekvm-vdec.rules"
 PACKAGES =+ "${PN}-diag"
 FILES:${PN}-diag = "${libexecdir}/onekvm/ax630c-once ${libexecdir}/onekvm/ax630c-eip130-ioctl-test ${libexecdir}/onekvm/ax630c-tdp-test ${libexecdir}/onekvm/ax630c-vdec-test ${libexecdir}/onekvm/ax630c-snapshot-conversion-test ${libexecdir}/onekvm/ax630c-schedule-trace.so"
 INSANE_SKIP:${PN} += "dev-so"
 RPROVIDES:${PN} += "onekvm-video-backend"
-RDEPENDS:${PN} += "kernel-module-lt6911 kernel-module-open-vin-csi2 kernel-module-open-vin-capture kernel-module-ax630c-venc-vcmd kernel-module-ax630c-tdp onekvm-l10n-en"
+AXERA_BRIDGE_MODULE = "kernel-module-lt6911"
+AXERA_BRIDGE_MODULE:onekvm-nanokvm-go = "kernel-module-lt7911-manage"
+RDEPENDS:${PN} += "${AXERA_BRIDGE_MODULE} kernel-module-open-vin-csi2 kernel-module-open-vin-capture kernel-module-ax630c-venc-vcmd kernel-module-ax630c-tdp onekvm-l10n-en"
 RDEPENDS:${PN} += "kernel-module-hantro-vpu gstreamer1.0-plugins-base-app gstreamer1.0-plugins-bad-v4l2codecs gstreamer1.0-plugins-bad-videoparsersbad"

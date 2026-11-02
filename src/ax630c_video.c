@@ -19,6 +19,7 @@
  */
 #define _GNU_SOURCE
 
+#include "ax_platform.h"
 #include <onekvm/video_backend_v1.h>
 
 #include <errno.h>
@@ -49,20 +50,19 @@
 #include "ax_snapshot.h"
 #include "ax_pacing.h"
 
-#define AX_DRIVER_ID "ax630c"
 #define AX_CAP_DEV "/dev/onekvm-vin"
 /* Power-of-two, matching the capture carveout's DMA bitmap slots. */
-#define AX_MAX_BUFS 8
+#define AX_MAX_BUFS AX_CAPTURE_BUFFERS
 /* Parameter sets precede the slice in the fixed encoder output region.
  * Core copies the borrowed AU before the next encode; clients cannot pin it. */
 #define AX_AU_HEADROOM 256
-#define AX_PROC_W "/proc/lt6911_info/width"
-#define AX_PROC_H "/proc/lt6911_info/height"
-#define AX_PROC_FPS "/proc/lt6911_info/fps"
-#define AX_PROC_RX "/proc/lt6911_info/hdmi_rx_status"
-#define AX_PROC_STATUS "/proc/lt6911_info/status"
-#define AX_PROC_POWER "/proc/lt6911_info/power"
-#define AX_PROC_RX_GEOMETRY "/proc/lt6911_info/rx_geometry"
+#define AX_PROC_W AX_BRIDGE_PROC "/width"
+#define AX_PROC_H AX_BRIDGE_PROC "/height"
+#define AX_PROC_FPS AX_BRIDGE_PROC "/fps"
+#define AX_PROC_RX AX_BRIDGE_PROC "/hdmi_rx_status"
+#define AX_PROC_STATUS AX_BRIDGE_PROC "/status"
+#define AX_PROC_POWER AX_BRIDGE_PROC "/power"
+#define AX_PROC_RX_GEOMETRY AX_BRIDGE_PROC "/rx_geometry"
 #define AX_PLACEHOLDER_W 1920u
 #define AX_PLACEHOLDER_H 1080u
 /* The bridge needs about 2.5 s from "disappear" to a new CSI mode. Sending a
@@ -238,6 +238,7 @@ static int ax_hdmi_mode(uint32_t *w, uint32_t *h, uint32_t *fps)
     FILE *f;
     uint32_t width = 0, height = 0, rate = 0;
 
+#ifndef AXERA_NANOKVM_GO
     f = fopen(AX_PROC_RX, "r");
     if (!f)
         return -1;
@@ -248,6 +249,7 @@ static int ax_hdmi_mode(uint32_t *w, uint32_t *h, uint32_t *fps)
     fclose(f);
     if (strncmp(status, "access", 6) != 0)
         return -1;
+#endif
     f = fopen(AX_PROC_POWER, "r");
     if (!f)
         return -1;
@@ -304,7 +306,7 @@ static int ax_rx_geometry(uint32_t *w, uint32_t *h)
     found = fscanf(file, "%u %u", &width, &height);
     fclose(file);
     if (found != 2 || width < 320 || height < 200 ||
-        width > 3840 || height > 2400 || (width & 1) || (height & 1))
+        width > AX_MAX_INPUT_WIDTH || height > AX_MAX_HEIGHT || (width & 1) || (height & 1))
         return -1;
     *w = width;
     *h = height;
@@ -457,7 +459,7 @@ static void ax_capture_snapshot(struct ax_source *src, unsigned index,
     uint32_t w = src->snapshot_width, h = src->snapshot_height;
     if (!w) ax_output_size(resolution, width, height, &w, &h);
     int rc = -EINVAL;
-    if (w && h && !(w & 1u) && w <= 4096 && h <= 2400) {
+    if (w && h && !(w & 1u) && w <= AX_MAX_WIDTH && h <= AX_MAX_HEIGHT) {
         struct v4l2_exportbuffer exp = {
             .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
             .index = index, .flags = O_CLOEXEC,
@@ -822,7 +824,8 @@ static int ax_capture_start(struct ax_source *src, uint32_t width, uint32_t heig
         return -1;
     }
     if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV ||
-        fmt.fmt.pix.width < 64 || fmt.fmt.pix.height < 64) {
+        fmt.fmt.pix.width < 64 || fmt.fmt.pix.height < 64 ||
+        fmt.fmt.pix.width > AX_MAX_INPUT_WIDTH || fmt.fmt.pix.height > AX_MAX_HEIGHT) {
         ax_err(error, error_cap, "capture rejected YUYV geometry");
         ax_capture_stop(src);
         return -1;
@@ -1427,7 +1430,7 @@ static int32_t ax_source_snapshot(void *source,
         !result || result->struct_size < sizeof(*result) || !data ||
         capacity > SIZE_MAX || request->flags || request->width < 0 ||
         request->height < 0 || !!request->width != !!request->height ||
-        request->width > 4096 || request->height > 2400 || (request->width & 1) ||
+        request->width > AX_MAX_WIDTH || request->height > AX_MAX_HEIGHT || (request->width & 1) ||
         !isfinite(request->quality_factor) || request->quality_factor < 0 ||
         request->quality_factor > 1 || request->timeout_ms > 1000) {
         ax_err(error, error_cap, "invalid snapshot request");
@@ -2330,7 +2333,9 @@ static int32_t ax_encoder_color_info(void *encoder,
 static const struct onekvm_video_format_v1 ax_formats[] = {
     {sizeof(struct onekvm_video_format_v1), 1920, 1080, 60, ONEKVM_VIDEO_PIXEL_UNKNOWN, 0},
     {sizeof(struct onekvm_video_format_v1), 1280, 720, 60, ONEKVM_VIDEO_PIXEL_UNKNOWN, 0},
+#ifndef AXERA_NANOKVM_GO
     {sizeof(struct onekvm_video_format_v1), 3840, 2160, 30, ONEKVM_VIDEO_PIXEL_UNKNOWN, 0},
+#endif
 };
 
 static const struct onekvm_video_backend_v1 ax_backend = {

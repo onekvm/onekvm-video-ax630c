@@ -1,6 +1,27 @@
-# Pro AX630C 视频流水线
+# Axera 视频流水线
 
 `ax630c.so` 从 `open_vin_capture` 读取 YUYV，优先把已出队的 capture DMA 缓冲区导入 VC8000E；导入失败才复制到编码器帧缓冲。Core 使用绑定编码器接口读取 H.264 或 H.265 AU。
+
+## NanoKVM Go AX620Q
+
+Go 按 AArch32 单独构建为 `ax620q.so`，共享 VIN、VCMD、TDP 和编码实现，
+桥片状态及 EDID 使用 `/proc/lt7911_info`。不读取 Pro 专用的
+`hdmi_rx_status`。VCMD 的 native 指针及物理地址字段必须跟随内核的
+`size_t` 宽度，command-pool 参数在 ARM32 为 44 字节、ARM64 为 72 字节。
+
+Go 描述符和后端格式表均提供 1080p60、720p60；采集与截图尺寸上限为
+1920×1080。采集最多四个 YUYV 缓冲，匹配 Go 32 MiB capture carveout。
+编码帧池另占 88 MiB，VCMD command/status 池占 8 MiB，合计保持原厂
+128 MiB 媒体边界。上述为实现预算，尚无 Go 实机性能验收结果。
+
+LT7911EXC 的 EDID 支持 128–512 字节，长度须与扩展块数完全一致，且各块
+校验和有效；读取使用内核缓存，不触发 Flash 访问或桥片复位。永久写入仅
+对 EXC 开放，LT7911D 不宣称写入能力，也不套用 LT6911UXC Shadow 协议。
+EXC 内核 writer 保留并校验 EDID 所在整个 64 KiB 擦除块的其他内容；安装和
+启动不自动写入 EDID。寄存器移植参考 Sipeed kernel
+`f0c18b62e4c4aca3638ca55bc0f359f9e724254f`，Flash 写入和 CSI lane 连线
+仍需 Go 实机验收。`make build/go-edid-test` 覆盖所有支持长度、截断读取、
+I/O 错误和 D 型号拒写；原 Pro `build/edid-test` 继续独立回归。
 
 ## LT6911 型号与诊断
 

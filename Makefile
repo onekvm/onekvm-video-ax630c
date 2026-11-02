@@ -31,7 +31,7 @@ TRANSFORM := ../onekvm-generic-v4l2/src/v4l2_transform.c
 build/tdp-v4l2-test: tests/tdp-v4l2-test.c $(TRANSFORM) | build
 	$(CC) -O2 -Wall -Wextra $(INC) -o $@ $^
 
-build/ax630c.so: Makefile $(TRANSFORM) src/ax630c_video.c src/ax_pacing.h src/ax_rate.c src/ax_rate.h src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_snapshot.c src/ax_snapshot.h src/ax_tdp.h src/ax_display.h $(wildcard third_party/vcenc-ewl/*.h) ../onekvm-core/include/onekvm/video_backend_v1.h | build
+build/ax630c.so: Makefile $(TRANSFORM) src/ax630c_video.c src/ax_platform.h src/ax_pacing.h src/ax_rate.c src/ax_rate.h src/ax_edid.c src/ax_edid.h src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_snapshot.c src/ax_snapshot.h src/ax_tdp.h src/ax_display.h $(wildcard third_party/vcenc-ewl/*.h) ../onekvm-core/include/onekvm/video_backend_v1.h | build
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ src/ax630c_video.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_snapshot.c $(TRANSFORM) -lm $(JPEG_LIBS)
 
 build/abi-smoke: tests/abi-smoke.c build/ax630c.so | build
@@ -91,8 +91,11 @@ build/vcenc-rc-test: tests/vcenc-rc-test.c $(wildcard third_party/vcenc-ewl/*.h)
 build/edid-quiesce-test: tests/edid-quiesce-test.c src/ax630c_video.c src/ax_edid.c $(TRANSFORM) | build
 	$(CC) $(CFLAGS) -pthread -Wl,--wrap=ioctl -Wl,--wrap=close -o $@ tests/edid-quiesce-test.c src/ax_rate.c src/ax_edid.c src/ax_no_signal.c src/ax_display.c src/ax_tdp.c src/ax_snapshot.c $(TRANSFORM) -lm $(JPEG_LIBS)
 
-build/edid-test: tests/edid-test.c src/ax_edid.c src/ax_edid.h | build
+build/edid-test: tests/edid-test.c src/ax_edid.c src/ax_edid.h src/ax_platform.h | build
 	$(CC) $(CFLAGS) -Wl,--wrap=open -Wl,--wrap=access -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=close -o $@ tests/edid-test.c src/ax_edid.c
+
+build/go-edid-test: tests/go-edid-test.c src/ax_edid.c src/ax_edid.h src/ax_platform.h | build
+	$(CC) $(CFLAGS) -DAXERA_NANOKVM_GO -Wl,--wrap=open -Wl,--wrap=access -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=close -o $@ tests/go-edid-test.c src/ax_edid.c
 
 build/hevc-header-test: tests/hevc-header-test.c third_party/vcenc-ewl/vcenc_hevc_header.h third_party/vcenc-ewl/vcenc_header.h | build
 	$(CC) -O2 -Wall $(INC) -o $@ tests/hevc-header-test.c

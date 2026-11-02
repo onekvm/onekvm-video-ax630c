@@ -63,26 +63,29 @@ struct dmabuf_import_parameter {
 /* module_type (vc8000_driver.h:256) */
 #define VCMD_TYPE_ENCODER 0
 
-/* ---- ABI structs (exact field order + sizes; ptr_t/dma_addr_t = 8B) ------ */
+/* Native ABI: the kernel uses size_t for ptr_t (4B AArch32 / 8B AArch64). */
 
-/* vc8000_driver.h:264-277. 72 bytes on arm64. Only the phys/hw-addr,
+/* vc8000_driver.h:264-277. 44 bytes on arm / 72 bytes on arm64. Only the phys/hw-addr,
  * total-size and unit-size fields are filled by the driver; the two
  * virt-addr pointers are NOT written (kernel pointers anyway). */
 struct cmdbuf_mem_parameter {
 	uint32_t *cmd_virt_addr;     /* NOT written by driver */
-	uint64_t  cmd_phy_addr;      /* command pool base (busAddress) */
-	uint64_t  cmd_hw_addr;       /* == cmd_phy_addr - base_ddr_addr(0) */
+	uintptr_t  cmd_phy_addr;      /* command pool base (busAddress) */
+	uintptr_t  cmd_hw_addr;       /* == cmd_phy_addr - base_ddr_addr(0) */
 	uint32_t  cmd_total_size;    /* 0x200000 */
 	uint16_t  cmd_unit_size;     /* 0x2000 */
 	uint32_t *status_virt_addr;  /* NOT written by driver */
-	uint64_t  status_phy_addr;   /* status pool base (busAddress) */
-	uint64_t  status_hw_addr;
+	uintptr_t  status_phy_addr;   /* status pool base (busAddress) */
+	uintptr_t  status_hw_addr;
 	uint32_t  status_total_size; /* 0x200000 */
 	uint16_t  status_unit_size;  /* 0x2000 */
-	uint64_t  base_ddr_addr;     /* 0 */
+	uintptr_t  base_ddr_addr;     /* 0 */
 };
 
-/* vc8000_driver.h:279-290. 28 bytes on arm64. */
+_Static_assert(sizeof(struct cmdbuf_mem_parameter) == (sizeof(void *) == 8 ? 72 : 44),
+               "VCMD native command-pool ABI");
+
+/* vc8000_driver.h:279-290. 24 bytes, independent of native pointer size. */
 struct config_parameter {
 	uint16_t module_type;             /* in */
 	uint16_t vcmd_core_num;           /* out: 1 */

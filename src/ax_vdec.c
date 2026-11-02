@@ -1,3 +1,4 @@
+#include "ax_platform.h"
 /* SPDX-License-Identifier: MIT
  * Platform ABI adapter for the standard V4L2 stateless H.264 Request API.
  * GStreamer's H264/DPB parser drives V4L2; no hardware registers or private
@@ -538,7 +539,7 @@ static int32_t reset(void *handle, char *err, uint32_t n) {
 
 static const struct onekvm_vdec_backend_v1 backend = {
     .struct_size = sizeof(backend), .abi_version = ONEKVM_VDEC_BACKEND_ABI_V1,
-    .driver_id = "ax630c", .backend_name = "AX630C V4L2 H.264 decoder + RGB converter",
+    .driver_id = AX_DRIVER_ID, .backend_name = "AX630C V4L2 H.264 decoder + RGB converter",
     .features = ONEKVM_VDEC_FEATURE_HARDWARE,
     .capabilities = capabilities, .create = create, .submit = submit, .receive = receive,
     .frame_release = frame_release, .reset = reset, .destroy = destroy,

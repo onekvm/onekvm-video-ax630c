@@ -28,7 +28,11 @@ link_node() {
 
 # Media module probe order does not guarantee /dev/video0 is VIN. Resolve
 # capture by its platform device before starting any video consumer.
-modprobe -a lt6911 open_vin_csi2 open_vin_capture ax630c_venc_vcmd
+bridge=lt6911
+if test -r /usr/share/onekvm/machine; then
+    case "$(cat /usr/share/onekvm/machine)" in nanokvm-go) bridge=lt7911_manage ;; esac
+fi
+modprobe -a "$bridge" open_vin_csi2 open_vin_capture ax630c_venc_vcmd
 link_node /dev/onekvm-vin open_vin_capture /sys/bus/platform/devices/*/video4linux/video*
 # Shared scaler/CSC alias: VIN and VDEC use this standard V4L2 mem2mem device.
 modprobe ax630c_tdp
