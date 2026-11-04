@@ -178,27 +178,40 @@ static int32_t ax_edid_set_impl(const struct onekvm_video_edid_blob_v1 *edid,
     if (!bridge_flash_supported(chip) || (!temporary && access(EDID_DEVICE, W_OK)))
         return edid_error(error, capacity, "HDMI bridge EDID interface is unavailable");
     pthread_mutex_lock(&edid_update_lock);
-    int paused = 0, result = -1;
-    const char *failure = "write or verify HDMI EDID failed";
+    int paused = 0, result = -1, failure_errno = 0;
+    const char *failure = NULL;
     if (ax_edid_capture_begin(error, capacity)) {
-        failure = NULL;
         goto out;
     }
     paused = 1;
     int fd = open(temporary ? EDID_SHADOW : EDID_DEVICE, O_WRONLY | O_CLOEXEC);
-    if (fd < 0) goto out;
+    if (fd < 0) {
+        failure = "open HDMI EDID interface";
+        failure_errno = errno;
+        goto out;
+    }
     ssize_t written;
     do {
         written = write(fd, edid->data, edid->size);
     } while (written < 0 && errno == EINTR);
+    if (written != edid->size) {
+        failure = "write or verify HDMI EDID";
+        failure_errno = written < 0 ? errno : EIO;
+    }
     int closed = close(fd);
-    if (written != edid->size || closed) goto out;
+    if (closed && !failure) {
+        failure = "close HDMI EDID interface";
+        failure_errno = errno;
+    }
+    if (failure) goto out;
     apply->apply_required = ONEKVM_VIDEO_EDID_APPLY_HOTPLUG;
     result = 0;
 out:
     if (paused) ax_edid_capture_end();
     pthread_mutex_unlock(&edid_update_lock);
-    if (result && failure) return edid_error(error, capacity, failure);
+    if (result && failure && error && capacity)
+        snprintf(error, capacity, "%s: %s (errno %d)", failure,
+                 strerror(failure_errno), failure_errno);
     return result;
 }
 

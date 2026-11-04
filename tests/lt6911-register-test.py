@@ -189,7 +189,11 @@ static int i2c_smbus_read_byte_data(void *client, u8 reg) {
     (void)client;
     int ret = bus_fault();
     if (ret) return ret;
-    if (shadow_mode && bank == 0xb0 && reg == 0xb0) return shadow[regs[bank][0x0a]];
+    /* Pro exposes the RAM window only with control bit 2 clear, including reads.
+     * The old driver reads a stable 0x60 baseline and rejects valid EDID.
+     */
+    if (shadow_mode && bank == 0xb0 && reg == 0xb0)
+        return (regs[bank][0x0b] & 4) ? 0x60 : shadow[regs[bank][0x0a]];
     return regs[bank][reg];
 }
 static int i2c_smbus_write_i2c_block_data(void *client, u8 reg, u8 len, const u8 *data) {

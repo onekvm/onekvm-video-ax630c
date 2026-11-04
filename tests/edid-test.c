@@ -21,7 +21,7 @@ int ax_edid_capture_begin(char *error, uint32_t capacity) {
     if (pause_error) return -1;
     paused = 1; return 0;
 }
-void ax_edid_capture_end(void) { assert(paused); paused = 0; }
+void ax_edid_capture_end(void) { assert(paused); paused = 0; errno = ECANCELED; }
 int __wrap_access(const char *path, int mode)
 {
     assert(mode == W_OK);
@@ -91,7 +91,9 @@ ssize_t __wrap_write(int fd, const void *data, size_t size)
 int __wrap_close(int fd)
 {
     assert(fd == 700 || fd == 701 || fd == 702);
-    return fd == 702 && close_error ? -1 : 0;
+    if (fd == 702 && close_error) { errno = EBADF; return -1; }
+    errno = 0;
+    return 0;
 }
 
 int main(void)
@@ -213,10 +215,16 @@ int main(void)
     write_error = 1;
     apply.apply_required = 99;
     assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && apply.apply_required == 99);
+    assert(strstr(error, "write or verify HDMI EDID") && strstr(error, "errno 5"));
+    close_error = 1;
+    assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0);
+    assert(strstr(error, "write or verify HDMI EDID") && strstr(error, "errno 5"));
+    close_error = 0;
     write_error = 0;
     short_write = 1;
     int before = writes;
     assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before + 1);
+    assert(strstr(error, "write or verify HDMI EDID") && strstr(error, "errno 5"));
     short_write = 0;
     chip_id = "lt6911uxc\n";
     before = writes;
@@ -230,6 +238,7 @@ int main(void)
     before = writes;
     close_error = 1;
     assert(ax_edid_set(&blob, &apply, error, sizeof(error)) != 0 && writes == before + 1 && !paused);
+    assert(strstr(error, "close HDMI EDID interface") && strstr(error, "errno 9"));
     close_error = 0;
 #ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
     caps.struct_size = sizeof(caps);
