@@ -11,7 +11,7 @@ Pro 的视频硬件驱动均以模块交付；`ax630c.so` 是独立的用户态�
 | TDP 缩放和格式转换 | `ax630c_tdp` |
 | Hantro 解码 | `hantro_vpu` |
 
-内核配方为上述驱动生成 modules-load 配置，视频后端依赖对应模块包。系统启动时由 systemd-modules-load 加载；持久化模块准备完成后还会重新应用静态加载配置，Core 在此之后启动。因此不依赖 udev 自动探测是否开启。
+CSI-2、VIN、VC8000E 与 TDP 驱动源码在 [`onekvm-ax620e-media`](../../../onekvm-ax620e-media/README.md)，由 `onekvm-ax620e-media-modules` 树外构建；桥片与 Hantro 仍随内核配方。两者都生成 modules-load 配置，视频后端依赖对应模块包名。系统启动时由 systemd-modules-load 加载；持久化模块准备完成后还会重新应用静态加载配置，Core 在此之后启动。因此不依赖 udev 自动探测是否开启。
 
 首次从内置驱动切换到模块需要安装配套内核、模块和镜像身份信息并重启。后续驱动内部修复若不改变内核 ABI，可以针对已发布的固定内核构建和更新模块，无须替换内核镜像。内核配置、公共头文件、导出符号或 ABI 变化仍需要配套系统更新；模块化不等于允许跨内核构建混用。
 
