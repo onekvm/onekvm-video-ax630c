@@ -1026,6 +1026,19 @@ static void ax_scale_yuyv(uint8_t *dst, uint32_t dst_w, uint32_t dst_h,
     }
 }
 
+/* Frames that could not be read in place by the encoder (DMA import failed or a
+ * padded capture stride) and had to be copied: expected to stay at zero. */
+static atomic_ullong ax_copy_fallbacks;
+
+static void ax_note_copy_fallback(void)
+{
+    unsigned long long n = atomic_fetch_add(&ax_copy_fallbacks, 1) + 1;
+
+    if ((n & (n - 1)) == 0)
+        fprintf(stderr, "ax630c: %llu frame(s) copied because the capture buffer "
+                "could not be encoded in place\n", n);
+}
+
 /* Scale the held VIN buffer with TDP into a buffer VC8000E reads in place.
  * Returns 0 with enc->scale_phys valid and the TDP output borrowed (release with
  * ax_tdp_snapshot_release() after the encode); otherwise -1 and the caller uses
@@ -2087,6 +2100,102 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
     return 0;
 }
 
+/* Encoded packets are produced in the write-combined VC8000E output area, whose
+ * reads bypass the cache. Move each access unit into a recycled heap buffer in
+ * one pass so Core does not allocate and copy it again per frame. */
+struct ax_taken_packet {
+    struct ax_taken_packet *next;
+    uint8_t *data;
+    size_t capacity;
+};
+
+static pthread_mutex_t ax_packet_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ax_taken_packet *ax_packet_pool;
+static uint32_t ax_packet_pool_count;
+#define AX_PACKET_POOL_MAX 8u
+
+static atomic_ullong ax_take_count, ax_take_bytes, ax_take_ns, ax_take_max_ns;
+
+static int32_t ax_encoder_take_packet(void *encoder, uint8_t **data, uint32_t *size,
+                                      void **owner)
+{
+    struct ax_encoder *enc = encoder;
+    struct ax_taken_packet *node;
+    uint64_t t0, dt, prev;
+    size_t len;
+
+    if (!enc || !data || !size || !owner || !enc->publish || !enc->packet_len)
+        return -1;
+    len = enc->packet_len;
+    pthread_mutex_lock(&ax_packet_pool_lock);
+    node = ax_packet_pool;
+    if (node) {
+        ax_packet_pool = node->next;
+        ax_packet_pool_count--;
+    }
+    pthread_mutex_unlock(&ax_packet_pool_lock);
+    if (!node) {
+        node = calloc(1, sizeof(*node));
+        if (!node)
+            return -1;
+    }
+    if (node->capacity < len) {
+        size_t cap = len + len / 4 + 4096;
+        uint8_t *grown = realloc(node->data, cap);
+
+        if (!grown) {
+            free(node->data);
+            free(node);
+            return -1;
+        }
+        node->data = grown;
+        node->capacity = cap;
+    }
+    t0 = ax_now_ns();
+    memcpy(node->data, enc->publish, len);
+    dt = ax_now_ns() - t0;
+    atomic_fetch_add(&ax_take_count, 1);
+    atomic_fetch_add(&ax_take_bytes, len);
+    atomic_fetch_add(&ax_take_ns, dt);
+    prev = atomic_load(&ax_take_max_ns);
+    while (dt > prev && !atomic_compare_exchange_weak(&ax_take_max_ns, &prev, dt))
+        ;
+    node->next = NULL;
+    if (getenv("ONEKVM_AX_STATS")) {
+        unsigned long long n = atomic_load(&ax_take_count);
+
+        if (n % 600 == 0)
+            fprintf(stderr, "ax630c: packet copies %llu, avg %llu B, avg %llu us, max %llu us, "
+                    "import-fallback copies %llu\n", n,
+                    atomic_load(&ax_take_bytes) / n, atomic_load(&ax_take_ns) / n / 1000,
+                    atomic_load(&ax_take_max_ns) / 1000, atomic_load(&ax_copy_fallbacks));
+    }
+    *data = node->data;
+    *size = (uint32_t)len;
+    *owner = node;
+    return 0;
+}
+
+static void ax_encoder_free_taken_packet(void *owner)
+{
+    struct ax_taken_packet *node = owner;
+
+    if (!node)
+        return;
+    pthread_mutex_lock(&ax_packet_pool_lock);
+    if (ax_packet_pool_count < AX_PACKET_POOL_MAX) {
+        node->next = ax_packet_pool;
+        ax_packet_pool = node;
+        ax_packet_pool_count++;
+        node = NULL;
+    }
+    pthread_mutex_unlock(&ax_packet_pool_lock);
+    if (node) {
+        free(node->data);
+        free(node);
+    }
+}
+
 static void ax_encoder_release_packet(void *encoder)
 {
     (void)encoder;
@@ -2392,6 +2501,7 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
         ax_err(error, error_cap, "capture frame is too small");
         return -1;
     }
+    ax_note_copy_fallback();
     ax_copy_yuyv(enc->fb_map + enc->geom.off_in, enc->geom.w * 2, frame,
                  stride, enc->geom.w, enc->geom.h);
     ax_requeue(src);
@@ -2522,6 +2632,8 @@ static const struct onekvm_video_backend_v1 ax_backend = {
     .edid_get = ax_edid_get,
     .edid_set = ax_edid_set,
     .encoder_color_info = ax_encoder_color_info,
+    .encoder_take_packet = ax_encoder_take_packet,
+    .encoder_free_taken_packet = ax_encoder_free_taken_packet,
 #ifdef ONEKVM_VIDEO_EDID_CAP_TEMPORARY
     .edid_set_mode = ax_edid_set_mode,
 #endif

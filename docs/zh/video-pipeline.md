@@ -156,6 +156,16 @@ BT.709；查询值与 SPS/VUI 生成器共用配置常量，不从 HDMI 输入�
 中断的精确发生时刻。浏览器按实际 RTP 时间戳匹配完整帧收包时间，校时估算、
 误差与缺失数据语义见 [`Core WebRTC 延迟规范`](../../../onekvm-core/docs/webrtc-low-latency.md#编码到收帧)。
 
+## 码流包移交
+
+VC8000E 输出区是 write-combine 映射，CPU 读取不经缓存（约 47 MB/s）。后端实现
+`encoder_take_packet`／`encoder_free_taken_packet`：每个 AU 一次拷入可复用的堆缓冲
+（最多缓存 8 个）后交给 Core，Core 不再逐帧分配再拷贝一次。105 实测 1080p 平均包
+约 6.8 KB、复制约 147 µs，IDR 最大约 5.4 ms；Core 单核 CPU 与原路径在误差内一致，
+收益只是少一次逐帧堆分配。进一步降低读取成本需要可缓存映射加显式 `dma_sync`（内核改动）。
+设置 `ONEKVM_AX_STATS=1` 时每 600 个包输出复制耗时及“因无法原位编码而整帧复制”的计数，
+正常应为 0。
+
 ## 采集延迟上报
 
 `capture_ns` 为一帧填充时间（实时输入帧率的一个周期）加该帧 VIN 完成时间戳到
