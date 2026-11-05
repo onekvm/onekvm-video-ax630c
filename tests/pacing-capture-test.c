@@ -93,6 +93,52 @@ int main(void)
     pending[0] = 2; pending[1] = 3; pending[2] = 4; count = 3;
     const uint8_t *frame = frames[0];
     char error[128];
+    {
+        /* Row-buffered scaler must match the original per-pixel algorithm. */
+        static const uint32_t sz[][4] = {{1920,1080,1280,720},{1920,1080,640,480},
+            {1280,720,1920,1080},{3840,2160,1920,1080},{1366,768,1280,720},{1920,1080,1920,1080}};
+        for (unsigned i = 0; i < sizeof(sz) / sizeof(sz[0]); i++) {
+            uint32_t sw = sz[i][0], sh = sz[i][1], dw = sz[i][2], dh = sz[i][3], stride = sw * 2 + 64;
+            uint8_t *in = malloc((size_t)stride * sh), *got = malloc((size_t)dw * dh * 2),
+                    *ref = malloc((size_t)dw * dh * 2);
+            for (size_t k = 0; k < (size_t)stride * sh; k++) in[k] = (uint8_t)(k * 2654435761u >> 13);
+            for (uint32_t y = 0; y < dh; y++)
+                for (uint32_t x = 0; x < dw; x += 2) {
+                    const uint8_t *r = in + (size_t)(uint64_t)y * sh / dh * stride;
+                    uint32_t sx = (uint32_t)((uint64_t)x * sw / dw) & ~1u;
+                    memcpy(ref + ((size_t)y * dw + x) * 2, r + (size_t)sx * 2, 4);
+                }
+            ax_scale_yuyv(got, dw, dh, in, stride, sw, sh);
+            assert(!memcmp(got, ref, (size_t)dw * dh * 2));
+            free(in); free(got); free(ref);
+        }
+    }
+    {
+        /* Capture latency = one live input frame + age of the VIN stamp at
+         * DQBUF. Idle poll() time must not appear in it. */
+        struct v4l2_buffer b = {.flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC};
+        struct timespec t;
+        uint64_t now, ns;
+
+        src.fps = 60;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        now = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+        ns = now - 5000000ull;
+        b.timestamp.tv_sec = ns / 1000000000ull;
+        b.timestamp.tv_usec = ns % 1000000000ull / 1000;
+        ax_update_capture_latency(&src, &b, ns);
+        assert(src.capture_ns >= 16666666ull + 5000000ull &&
+               src.capture_ns < 16666666ull + 5000000ull + 2000000ull);
+        src.fps = 30;
+        ax_update_capture_latency(&src, &b, ns);
+        assert(src.capture_ns >= 33333333ull + 5000000ull);
+        b.flags = 0; /* non-monotonic stamp: frame period only */
+        ax_update_capture_latency(&src, &b, ns);
+        assert(src.capture_ns == 33333333ull);
+        b.flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+        ax_update_capture_latency(&src, &b, now + 1000000000ull); /* future */
+        assert(src.capture_ns == 33333333ull);
+    }
     assert(ax_latest_capture(&src, &frame, error, sizeof(error)) == 0);
     assert(frame == frames[4] && src.held_index == 4 && src.held);
     assert(next == 3 && requeues == 3 && queued[0] == 0 && queued[1] == 2 && queued[2] == 3);

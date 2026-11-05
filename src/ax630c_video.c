@@ -341,12 +341,30 @@ static int ax_recovery_due(struct ax_source *src, uint64_t now)
     return 1;
 }
 
+/* Capture latency is one frame fill time (the progressive scan that ends at
+ * the VIN frame-done stamp) plus the age of that stamp when DQBUF returns.
+ * Time spent in poll() waiting for the next frame is idle time, not latency.
+ * The frame period follows the live input rate, not the encoder's target. */
+static void ax_update_capture_latency(struct ax_source *src,
+                                      const struct v4l2_buffer *buf, uint64_t ns)
+{
+    uint64_t period = 1000000000ull / ax_nominal_fps(src->fps);
+    uint64_t now = ax_now_ns();
+    uint64_t age = 0;
+
+    if (!(buf->flags & V4L2_BUF_FLAG_ERROR) && ns && ns <= now &&
+        (buf->flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC)
+        age = now - ns;
+    src->capture_ns = period + age;
+}
+
 /* DQ timestamps and sequence numbers originate in VIN IRQ completions.  They
  * still measure the input cadence when the encoder is paced or drops frames. */
 static void ax_observe_capture(struct ax_source *src, const struct v4l2_buffer *buf)
 {
     uint64_t ns = (uint64_t)buf->timestamp.tv_sec * 1000000000ull +
                   (uint64_t)buf->timestamp.tv_usec * 1000;
+    ax_update_capture_latency(src, buf, ns);
     if ((buf->flags & V4L2_BUF_FLAG_ERROR) || !ns ||
         (buf->flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) != V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC ||
         buf->bytesused < (uint64_t)src->bytesperline * src->height) {
@@ -948,22 +966,38 @@ static void ax_copy_yuyv(uint8_t *dst, uint32_t dst_stride, const uint8_t *src,
 }
 
 /* VC8000E consumes packed YUYV. Keep direct DMA for 1:1; selected output
- * sizes use a small nearest-neighbour conversion into its input framebuf. */
+ * sizes use a nearest-neighbour conversion into its input framebuf.
+ *
+ * The VIN mapping is coherent (uncached): every CPU load is a bus access, so
+ * touching it per pixel costs ~80 ms for 1080p->720p. Read each needed source
+ * row once, sequentially, into a cacheable line buffer and gather pixels from
+ * there with a precomputed column table. */
+#define AX_SCALE_MAX_SRC_ROW 8192u   /* bytes: up to 4096 YUYV pixels */
+#define AX_SCALE_MAX_DST_PAIRS 2048u
+
 static void ax_scale_yuyv(uint8_t *dst, uint32_t dst_w, uint32_t dst_h,
                           const uint8_t *src, uint32_t src_stride,
                           uint32_t src_w, uint32_t src_h)
 {
-    uint32_t y, x;
+    uint8_t line[AX_SCALE_MAX_SRC_ROW];
+    uint32_t cols[AX_SCALE_MAX_DST_PAIRS];
+    uint32_t y, x, pairs = dst_w / 2, last_row = UINT32_MAX;
 
+    if (!dst_w || !dst_h || src_w * 2 > sizeof(line) || pairs > AX_SCALE_MAX_DST_PAIRS ||
+        src_w < 2)
+        return;
+    for (x = 0; x < pairs; x++)
+        cols[x] = (uint32_t)((uint64_t)(x * 2) * src_w / dst_w & ~1ull) * 2;
     for (y = 0; y < dst_h; y++) {
-        const uint8_t *src_row = src + (size_t)(uint64_t)y * src_h / dst_h * src_stride;
+        uint32_t sy = (uint32_t)((uint64_t)y * src_h / dst_h);
         uint8_t *dst_row = dst + (size_t)y * dst_w * 2;
 
-        for (x = 0; x < dst_w; x += 2) {
-            uint32_t src_x = (uint32_t)((uint64_t)x * src_w / dst_w) & ~1u;
-
-            memcpy(dst_row + (size_t)x * 2, src_row + (size_t)src_x * 2, 4);
+        if (sy != last_row) {
+            memcpy(line, src + (size_t)sy * src_stride, (size_t)src_w * 2);
+            last_row = sy;
         }
+        for (x = 0; x < pairs; x++)
+            memcpy(dst_row + (size_t)x * 4, line + cols[x], 4);
     }
 }
 
@@ -1121,7 +1155,6 @@ static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
     struct pollfd pfd[2];
     struct v4l2_buffer buf;
     int rc;
-    uint64_t t0;
 
     ax_collect_display_job(src, 0, 1);
     if (atomic_load(&src->interrupted)) {
@@ -1134,7 +1167,6 @@ static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
     pfd[1].fd = src->wake_fd;
     pfd[1].events = POLLIN;
     pfd[1].revents = 0;
-    t0 = ax_now_ns();
     /* Three frame times. A dead DMA ring must not sit for a full second. */
     {
         unsigned fps = src->fps >= 10 && src->fps <= 240 ? src->fps : 60;
@@ -1146,7 +1178,6 @@ static int ax_grab_frame_budget(struct ax_source *src, const uint8_t **data,
             budget = timeout_ms;
         rc = poll(pfd, src->wake_fd >= 0 ? 2 : 1, (int)budget);
     }
-    src->capture_ns = ax_now_ns() - t0;
     if (rc < 0) {
         if (errno == EINTR)
             return 1;
