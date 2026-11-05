@@ -53,6 +53,40 @@ static int ax_tdp_acquire(struct ax_tdp *tdp, struct onekvm_v4l2_transform_frame
     return 0;
 }
 
+int ax_tdp_scale_yuyv(struct ax_tdp *tdp, struct onekvm_v4l2_transform_frame *frame,
+                      uint32_t dw, uint32_t dh, int input_fd, uint32_t stride,
+                      uint32_t sw, uint32_t sh, int *recreated)
+{
+    int rc;
+    if (!frame || !recreated || !dw || !dh || (dw & 1u) || dw > 4096 || dh > 2400 ||
+        !sw || !sh || sw > 4096 || sh > 2400 || input_fd < 0)
+        return -EINVAL;
+    *recreated = 0;
+    struct onekvm_v4l2_transform_config config = {
+        .width = sw, .height = sh, .stride = stride, .pixel_format = V4L2_PIX_FMT_YUYV,
+        .crop_width = sw, .crop_height = sh, .output_width = dw, .output_height = dh,
+        .colorspace = V4L2_COLORSPACE_REC709, .ycbcr_enc = V4L2_YCBCR_ENC_709,
+        .quantization = V4L2_QUANTIZATION_LIM_RANGE, .xfer_func = V4L2_XFER_FUNC_709,
+        .output_pixel_format = V4L2_PIX_FMT_YUYV,
+    };
+    if (!onekvm_v4l2_transform_matches(tdp->transform, &config)) {
+        ax_tdp_close(tdp);
+        rc = onekvm_v4l2_transform_create("/dev/onekvm-vproc", &config, &tdp->transform);
+        if (rc) return rc;
+        *recreated = 1;
+    }
+    rc = onekvm_v4l2_transform_submit(tdp->transform, input_fd, 0);
+    if (rc) { ax_tdp_close(tdp); *recreated = 1; return rc; }
+    rc = onekvm_v4l2_transform_receive(tdp->transform, frame, 250);
+    if (rc) { ax_tdp_close(tdp); *recreated = 1; return rc; }
+    return 0;
+}
+
+int ax_tdp_export_output(struct ax_tdp *tdp, int *dma_buf_fd)
+{
+    return onekvm_v4l2_transform_export_output(tdp->transform, dma_buf_fd);
+}
+
 int ax_tdp_convert(struct ax_tdp *tdp, uint8_t *out, uint32_t dw, uint32_t dh,
                    int input_fd, uint32_t stride, uint32_t sw, uint32_t sh)
 {

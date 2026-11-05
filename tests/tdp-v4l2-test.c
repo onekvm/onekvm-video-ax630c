@@ -147,6 +147,48 @@ static void run(unsigned pixel, int bt709, int full, int crop, unsigned jobs) {
     onekvm_v4l2_transform_destroy(t);
     input_destroy(&in);
 }
+/* Scale-only YUYV output: pixels must keep the source's limited-range YUV. */
+static void run_yuyv_out(unsigned w, unsigned h, unsigned dw, unsigned dh, unsigned jobs) {
+    struct input in=input_create(w,h,V4L2_PIX_FMT_YUYV);
+    struct onekvm_v4l2_transform_config c = {
+        .width=w,.height=h,.stride=in.stride,.pixel_format=V4L2_PIX_FMT_YUYV,
+        .crop_width=w,.crop_height=h,.output_width=dw,.output_height=dh,
+        .colorspace=V4L2_COLORSPACE_REC709,.ycbcr_enc=V4L2_YCBCR_ENC_709,
+        .quantization=V4L2_QUANTIZATION_LIM_RANGE,
+        .output_pixel_format=V4L2_PIX_FMT_YUYV,
+    };
+    struct onekvm_v4l2_transform *t=NULL;
+    int rc=onekvm_v4l2_transform_create("/dev/onekvm-vproc",&c,&t);
+    if (rc) { fprintf(stderr,"YUYV output create failed: %d\n",rc); exit(1); }
+    struct onekvm_v4l2_transform_frame f;
+    double wall=seconds(CLOCK_MONOTONIC);
+    unsigned worst=0;
+    for (unsigned i=0;i<jobs;++i) {
+        CHECK(onekvm_v4l2_transform_submit(t,in.dma,0)==0);
+        CHECK(onekvm_v4l2_transform_receive(t,&f,500)==0);
+        CHECK(f.width==dw && f.height==dh && f.stride>=dw*2);
+        for (unsigned b=0;b<8;++b) {
+            unsigned x=((2*b+1)*dw/16)&~1u;
+            const uint8_t *p=f.data+(size_t)(dh/2)*f.stride+x*2;
+            unsigned bar=(uint64_t)x*8/dw;
+            for (unsigned k=0;k<3;++k) {
+                unsigned got=p[k==0?0:k==1?1:3];
+                unsigned delta=abs((int)got-(int)bars[bar][k]);
+                if (delta>worst) worst=delta;
+                if (delta>6) {
+                    fprintf(stderr,"YUYV mismatch bar=%u comp=%c got=%u want=%u (Y0 %u U %u Y1 %u V %u)\n",
+                        bar,"YUV"[k],got,bars[bar][k],p[0],p[1],p[2],p[3]);
+                    exit(1);
+                }
+            }
+        }
+        onekvm_v4l2_transform_release(t);
+    }
+    printf("PASS YUYV->YUYV %ux%u->%ux%u jobs=%u worst_delta=%u wall_ms=%.3f\n",
+        w,h,dw,dh,jobs,worst,(seconds(CLOCK_MONOTONIC)-wall)*1000);
+    onekvm_v4l2_transform_destroy(t);
+    input_destroy(&in);
+}
 static void source_rebind(void) {
     struct input inputs[34];
     struct onekvm_v4l2_transform_config c={
@@ -186,6 +228,12 @@ static void source_rebind(void) {
 int main(int argc,char **argv) {
     unsigned jobs=argc>1?strtoul(argv[1],NULL,10):10;
     CHECK(jobs && jobs<=1000);
+    if (argc>2 && !strcmp(argv[2],"yuyv")) {
+        run_yuyv_out(480,368,320,240,jobs);
+        run_yuyv_out(1920,1080,1280,720,jobs);
+        run_yuyv_out(1920,1080,640,480,jobs);
+        return 0;
+    }
     source_rebind();
     for(unsigned format=0;format<2;++format)
         for(int matrix=0;matrix<2;++matrix)

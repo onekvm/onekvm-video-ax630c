@@ -21,4 +21,12 @@ int ax_tdp_snapshot_acquire(struct ax_tdp *tdp, struct onekvm_v4l2_transform_fra
                             uint32_t dw, uint32_t dh,
                     int input_fd, uint32_t stride, uint32_t sw, uint32_t sh);
 void ax_tdp_snapshot_release(struct ax_tdp *tdp);
+/* Hardware scale-only: packed YUYV in, packed YUYV out, no colour conversion.
+ * The output stays owned by the transform until ax_tdp_snapshot_release().
+ * *recreated is set when the transform was (re)built, i.e. any earlier export
+ * or import of its output is stale. */
+int ax_tdp_scale_yuyv(struct ax_tdp *tdp, struct onekvm_v4l2_transform_frame *frame,
+                      uint32_t dw, uint32_t dh, int input_fd, uint32_t stride,
+                      uint32_t sw, uint32_t sh, int *recreated);
+int ax_tdp_export_output(struct ax_tdp *tdp, int *dma_buf_fd);
 #endif

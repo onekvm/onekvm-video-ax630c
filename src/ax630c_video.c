@@ -182,6 +182,11 @@ struct ax_encoder {
     uint64_t packet_pts;
     uint64_t encode_ns;
     uint8_t *publish;
+    /* Hardware (TDP) scaler for video.resolution != input. Its output buffer is
+     * imported into VC8000E once per transform; the CPU never reads VIN. */
+    struct ax_tdp scale_hw;
+    uint32_t scale_phys;
+    int scale_failed;
 };
 
 static void ax_err(char *error, uint32_t cap, const char *msg)
@@ -912,8 +917,28 @@ static void *ax_map_pool(int fd, uint64_t phys, uint32_t size)
     return p == MAP_FAILED ? NULL : p;
 }
 
+static void ax_scale_release_import(struct ax_encoder *enc)
+{
+    if (enc->scale_phys && enc->venc_fd >= 0) {
+        struct dmabuf_import_parameter rel;
+
+        memset(&rel, 0, sizeof(rel));
+        rel.bus_addr = enc->scale_phys;
+        ioctl(enc->venc_fd, HANTRO_IOCH_RELEASE_DMABUF, &rel);
+    }
+    enc->scale_phys = 0;
+}
+
+static void ax_scale_close(struct ax_encoder *enc)
+{
+    ax_tdp_close(&enc->scale_hw);
+    ax_scale_release_import(enc);
+}
+
 static void ax_encoder_release_framebuf(struct ax_encoder *enc)
 {
+    ax_scale_close(enc);
+    enc->scale_failed = 0; /* retry hardware scaling after a rebind */
     atomic_store(&enc->color_info, 0);
     if (enc->fb_map && enc->fb_map != MAP_FAILED)
         munmap(enc->fb_map, enc->fb.size ? enc->fb.size : enc->geom.span);
@@ -999,6 +1024,74 @@ static void ax_scale_yuyv(uint8_t *dst, uint32_t dst_w, uint32_t dst_h,
         for (x = 0; x < pairs; x++)
             memcpy(dst_row + (size_t)x * 4, line + cols[x], 4);
     }
+}
+
+/* Scale the held VIN buffer with TDP into a buffer VC8000E reads in place.
+ * Returns 0 with enc->scale_phys valid and the TDP output borrowed (release with
+ * ax_tdp_snapshot_release() after the encode); otherwise -1 and the caller uses
+ * the CPU scaler. The caller holds src->lock with the VIN buffer dequeued. */
+static int ax_scale_hw(struct ax_encoder *enc, struct ax_source *src, uint32_t stride)
+{
+    struct onekvm_v4l2_transform_frame frame;
+    struct v4l2_exportbuffer exp;
+    int recreated = 0, rc, fd;
+
+    if (enc->scale_failed || !src->held || enc->venc_fd < 0)
+        return -1;
+    memset(&exp, 0, sizeof(exp));
+    exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    exp.index = src->held_index;
+    exp.flags = O_CLOEXEC;
+    if (ioctl(src->cap_fd, VIDIOC_EXPBUF, &exp) < 0) {
+        rc = -errno;
+        goto fail;
+    }
+    rc = ax_tdp_scale_yuyv(&enc->scale_hw, &frame, enc->geom.w, enc->geom.h,
+                           exp.fd, stride, src->width, src->height, &recreated);
+    close(exp.fd);
+    if (recreated)
+        ax_scale_release_import(enc);
+    if (rc)
+        goto fail;
+    if (frame.stride != enc->geom.w * 2) {
+        rc = -EPROTO;
+        goto fail_release;
+    }
+    if (!enc->scale_phys) {
+        struct dmabuf_import_parameter im;
+
+        rc = ax_tdp_export_output(&enc->scale_hw, &fd);
+        if (rc)
+            goto fail_release;
+        memset(&im, 0, sizeof(im));
+        im.fd = fd;
+        if (ioctl(enc->venc_fd, HANTRO_IOCH_IMPORT_DMABUF, &im) < 0) {
+            rc = -errno;
+            close(fd);
+            goto fail_release;
+        }
+        close(fd);
+        if (im.size < (uint64_t)enc->geom.w * enc->geom.h * 2 ||
+            im.bus_addr > 0xfffffffful) {
+            struct dmabuf_import_parameter rel;
+
+            memset(&rel, 0, sizeof(rel));
+            rel.bus_addr = im.bus_addr;
+            ioctl(enc->venc_fd, HANTRO_IOCH_RELEASE_DMABUF, &rel);
+            rc = -EINVAL;
+            goto fail_release;
+        }
+        enc->scale_phys = (uint32_t)im.bus_addr;
+    }
+    return 0;
+fail_release:
+    ax_tdp_snapshot_release(&enc->scale_hw);
+fail:
+    fprintf(stderr, "ax630c: TDP scaling unavailable (%s), using CPU scaler\n",
+            strerror(rc < 0 ? -rc : rc));
+    ax_scale_close(enc);
+    enc->scale_failed = 1;
+    return -1;
 }
 
 static void ax_output_size(int32_t resolution, uint32_t input_w, uint32_t input_h,
@@ -2249,6 +2342,18 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
      * Returning it first would let VIN overwrite the frame mid-encode.
      */
     if (enc->geom.w != src->width || enc->geom.h != src->height) {
+        if (ax_scale_hw(enc, src, stride) == 0) {
+            /* VIN is no longer read once TDP has produced its output. */
+            ax_requeue(src);
+            pthread_mutex_unlock(&src->lock);
+            rc = ax_encode_yuyv(enc, NULL, 0, enc->scale_phys, is_idr, gopn);
+            ax_tdp_snapshot_release(&enc->scale_hw);
+            if (rc != 0) {
+                ax_err(error, error_cap, "VC8000E scaled encode failed");
+                return -1;
+            }
+            goto encoded;
+        }
         ax_scale_yuyv(enc->fb_map + enc->geom.off_in,
                       enc->geom.w, enc->geom.h, frame, stride,
                       src->width, src->height);
