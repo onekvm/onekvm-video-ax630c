@@ -232,6 +232,12 @@ int main(int argc,char **argv) {
         run_yuyv_out(480,368,320,240,jobs);
         run_yuyv_out(1920,1080,1280,720,jobs);
         run_yuyv_out(1920,1080,640,480,jobs);
+        if (argc>3 && !strcmp(argv[3],"sweep")) {
+            run_yuyv_out(1920,1080,1920,1080,jobs);
+            run_yuyv_out(1920,1080,320,184,jobs);
+            run_yuyv_out(1280,720,640,360,jobs);
+            run_yuyv_out(960,540,640,360,jobs);
+        }
         return 0;
     }
     source_rebind();
