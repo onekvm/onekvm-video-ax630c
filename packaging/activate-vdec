@@ -10,6 +10,9 @@ link_node() {
     alias=$1
     expected_name=$2
     shift 2
+    # Decoder nodes are group video (extensions with device-video decode);
+    # capture and the scaler stay root-only.
+    case "$alias" in /dev/onekvm-vdec*) mode=0660 ;; *) mode=0600 ;; esac
     for node do
         test -d "$node" || continue
         if test -n "$expected_name"; then
@@ -18,7 +21,8 @@ link_node() {
         fi
         target="/dev/${node##*/}"
         test -c "$target"
-        chmod 0600 "$target"
+        chmod "$mode" "$target"
+        test "$mode" = 0600 || chgrp video "$target"
         ln -sfn "$target" "$alias"
         return 0
     done
