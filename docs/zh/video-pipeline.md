@@ -365,7 +365,7 @@ API 表查询不打开设备。只有实际解码需求才创建会话，硬件�
 
 `open_vin_capture` 在 STREAMON 前取得 runtime PM 引用，STREAMOFF 停止 SIF/WDMA/CSI 并排空中断和 AXI 请求。空闲 1 秒后关闭 ISP 内部 gates 及 VI/ISP_MM 公共时钟；AXI 仍忙时拒绝关钟。快速重开即使取消了 autosuspend，也要重新放行 AXI。恢复只开时钟并恢复请求，不重复全局 reset 扫描。CSI 停流继续关闭 D-PHY 和自身时钟；空闲状态查询只返回缓存计数，不读已关钟的寄存器。
 
-VCMD 同时持有文件生命周期和命令引用，覆盖 ioctl、映射及最终关闭的 abort/寄存器访问，最后关闭后空闲 1 秒再关 VENC 时钟。关闭异常且 DMA 未确认停止时保留供电。诊断用 JENC/VDEC 驱动只在读取寄存器或改频率时唤醒，并在空闲 1 秒后关钟。所有模块保留 reset 状态，不逐帧切换时钟。
+VCMD 同时持有文件生命周期和命令引用，覆盖 ioctl、映射及最终关闭的 abort/寄存器访问，最后关闭后空闲 1 秒再关 VENC 时钟。关闭异常且 DMA 未确认停止时保留供电。可选的 `ax630c_venc_v4l2` 在 OUTPUT STREAMON 时以内核客户端身份打开同一 VCMD 文件接口，STREAMOFF 时关闭，引用与时钟规则相同；它与 Core 按命令缓冲交替使用编码器，不共享码控或帧缓冲。诊断用 JENC/VDEC 驱动只在读取寄存器或改频率时唤醒，并在空闲 1 秒后关钟。所有模块保留 reset 状态，不逐帧切换时钟。
 
 HDMI 输入经 LT86102UXE 分配到 HDMI OUT 和 LT6911UXC 采集桥。空闲策略只管理 SoC 采集/编码侧，不切换 `/proc/lt6911_info/{power,hdmi_power,loopout_power}`，保留桥片 EDID/HPD 和持续环出。不能用移除 `clk_ignore_unused` 代替驱动的资源管理。
 

@@ -10,10 +10,13 @@ Pro 的视频硬件驱动均以模块交付；`ax630c.so` 是独立的用户态�
 | VC8000E 编码命令引擎 | `ax630c_venc_vcmd` |
 | TDP 缩放和格式转换 | `ax630c_tdp` |
 | Hantro 解码 | `hantro_vpu` |
+| 可选：V4L2 编码器（YUYV → H.264/H.265） | `ax630c_venc_v4l2` |
 
 CSI-2、VIN、VC8000E 与 TDP 驱动源码在 [`osdrv-ax620e`](../../../osdrv-ax620e/README.md)，由 `onekvm-ax620e-media-modules` 树外构建；桥片与 Hantro 仍随内核配方。两者都生成 modules-load 配置，视频后端依赖对应模块包名。系统启动时由 systemd-modules-load 加载；持久化模块准备完成后还会重新应用静态加载配置，Core 在此之后启动。因此不依赖 udev 自动探测是否开启。
 
 首次从内置驱动切换到模块需要安装配套内核、模块和镜像身份信息并重启。后续驱动内部修复若不改变内核 ABI，可以针对已发布的固定内核构建和更新模块，无须替换内核镜像。内核配置、公共头文件、导出符号或 ABI 变化仍需要配套系统更新；模块化不等于允许跨内核构建混用。
+
+`ax630c_venc_v4l2` 单独打包为 `kernel-module-ax630c-venc-v4l2`，默认镜像不带、后端不依赖。它通过 `ax630c_venc_vcmd` 的内核接口提交命令，与 Core 的 `/dev/es_venc` 会话共享编码器时间片；1080p 单帧硬件编码约 6.6 ms。105 实测 Core 1080p60 与一路 1080p30 或 1080p60 V4L2 编码并发时，浏览器仍为 60 FPS、两路无错误；但编码器按命令缓冲先后执行，Core 一帧可能等完对方正在编的一帧。两路同为 60 FPS 时，按提交相位不同，Core 编码等待中位数在 6.6 ms 与 12.4 ms 之间。重载 `ax630c_venc_vcmd` 前先卸载它。
 
 模块加载顺序和重载可能改变 `/dev/videoN` 编号。启动助手按平台设备识别 VIN、TDP 与 Hantro，分别刷新 `/dev/onekvm-vin`、`/dev/onekvm-vproc`、`/dev/onekvm-vdec` 和解码器 media 别名；不能只检查旧别名仍指向字符设备。后端默认使用 VIN 别名，创建和重置采集源时均将历史 `/dev/video0` 配置映射到该别名，保留显式指定的其他设备路径。编码自动协商、配置重置等路径必须复用相同的映射，不能把采集节点覆盖回编号路径。重载后需重新执行 `onekvm-vdec.service` 的启动助手，再恢复消费者。
 
