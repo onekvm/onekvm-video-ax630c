@@ -39,6 +39,10 @@ void onekvm_v4l2_transform_release(struct onekvm_v4l2_transform *t)
 {
     (void)t; assert(borrowed); borrowed = 0;
 }
+int onekvm_v4l2_transform_export_output(struct onekvm_v4l2_transform *t, int *fd)
+{
+    (void)t; (void)fd; return -ENOSYS;
+}
 static void check_display(struct ax_tdp *tdp, uint32_t sw, uint32_t sh)
 {
     uint8_t out[640 * 360 * 2 + 2]; memset(out, 0xa5, sizeof(out));
