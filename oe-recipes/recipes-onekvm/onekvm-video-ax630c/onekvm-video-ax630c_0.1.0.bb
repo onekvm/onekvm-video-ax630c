@@ -1,7 +1,7 @@
 SUMMARY = "AX630C native HDMI capture and VC8000E video backend"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
-PR = "r14"
+PR = "r15"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
 COMPATIBLE_MACHINE = "^(onekvm-nanokvm-pro|onekvm-nanokvm-go)$"
@@ -15,7 +15,7 @@ inherit systemd pkgconfig
 SYSTEMD_SERVICE:${PN} = "onekvm-vdec.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
-ONEKVM_COMPONENT_GIT_URI ??= "git://github.com/onekvm/onekvm-video-ax630c.git;protocol=https;branch=main"
+ONEKVM_COMPONENT_GIT_URI ??= "git://github.com/onekvm/onekvm-video-ax630c.git;protocol=https;branch=master"
 ONEKVM_COMPONENT_SRCREV ??= ""
 SRC_URI = "${ONEKVM_COMPONENT_GIT_URI}"
 SRCREV = "${ONEKVM_COMPONENT_SRCREV}"
