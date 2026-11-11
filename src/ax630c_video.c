@@ -929,10 +929,23 @@ static void ax_scale_release_import(struct ax_encoder *enc)
     enc->scale_phys = 0;
 }
 
+/* The scaler is the third VIN borrower besides preview and snapshot. Each
+ * frame is exported anew, so its transform caches up to 32 imports and pins
+ * the whole ring. ax_capture_stop() cannot drop it: the encoder uses the
+ * scaler outside src->lock. Encoder-thread callers release it with this helper
+ * before VIN frees or reallocates its pool. */
 static void ax_scale_close(struct ax_encoder *enc)
 {
     ax_tdp_close(&enc->scale_hw);
     ax_scale_release_import(enc);
+}
+
+static int ax_encoder_capture_start(struct ax_encoder *enc, struct ax_source *src,
+                                    uint32_t width, uint32_t height,
+                                    char *error, uint32_t error_cap)
+{
+    ax_scale_close(enc);
+    return ax_capture_start(src, width, height, error, error_cap);
 }
 
 static void ax_encoder_release_framebuf(struct ax_encoder *enc)
@@ -2055,8 +2068,10 @@ static int ax_enter_placeholder(struct ax_encoder *enc, struct ax_source *src,
         pthread_mutex_unlock(&src->lock);
         return 0;
     }
-    if (!refresh)
+    if (!refresh) {
+        ax_scale_close(enc);
         ax_capture_stop(src);
+    }
     if (!enc->have_geom || enc->geom.w != width || enc->geom.h != height) {
         if (ax_encoder_alloc_framebuf(enc, width, height, error, error_cap) != 0) {
             pthread_mutex_unlock(&src->lock);
@@ -2211,7 +2226,7 @@ static int ax_bind_capture_locked(struct ax_encoder *enc, struct ax_source *src,
     uint32_t previous_w = src->width, previous_h = src->height;
 
     atomic_store(&src->interrupted, 0);
-    if (ax_capture_start(src, w, h, error, error_cap) != 0)
+    if (ax_encoder_capture_start(enc, src, w, h, error, error_cap) != 0)
         return -1;
     src->fps = fps;
     ax_output_size(src->output_resolution, src->width, src->height,
@@ -2395,7 +2410,8 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
                 rc = -1;
         } else if (enc->early_capture || rx_probe == 1 || rx_probe == 0) {
             if (enc->early_capture && ax_recovery_due(src, ax_now_ms())) {
-                if (ax_capture_start(src, src->width, src->height, error, error_cap) == 0) {
+                if (ax_encoder_capture_start(enc, src, src->width, src->height,
+                                             error, error_cap) == 0) {
                     ax_import_capture(src, enc->venc_fd);
                     enc->force_idr = 1;
                 }
@@ -2415,7 +2431,8 @@ static int32_t ax_encoder_read_packet(void *encoder, struct onekvm_video_packet_
                     rc = ax_grab_frame(src, &frame, &stride, error, error_cap);
                 } else if (ax_recovery_due(src, ax_now_ms())) {
                     fprintf(stderr, "ax630c: capture stalled, restarting DMA ring\n");
-                    if (ax_capture_start(src, src->width, src->height, error, error_cap) == 0) {
+                    if (ax_encoder_capture_start(enc, src, src->width, src->height,
+                                                 error, error_cap) == 0) {
                         ax_import_capture(src, enc->venc_fd);
                         enc->force_idr = 1;
                         rc = ax_grab_frame(src, &frame, &stride, error, error_cap);

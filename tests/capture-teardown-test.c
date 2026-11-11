@@ -52,6 +52,20 @@ int main(void)
         ax_capture_stop(&src);  /* Repeated teardown must be harmless. */
     }
     assert(closes == 1);
-    puts("capture teardown: drain previews, release all DMA-BUF borrowers before VIN, failed-open cleanup PASS");
+
+    /* The encoder's TDP scaler also caches imports of the whole ring and is
+     * used outside src->lock: the encoder thread drops it before VIN frees
+     * the old pool for a same-size restart or a new mode. */
+    struct ax_encoder enc = { .venc_fd = -1 };
+    enc.scale_hw.transform = (struct onekvm_v4l2_transform *)(uintptr_t)3;
+    pins = 1;
+    src.cap_fd = 123;
+    src.streaming = 1;
+    src.nbufs = AX_MAX_BUFS;
+    snprintf(src.device, sizeof(src.device), "/nonexistent/onekvm-vin");
+    assert(ax_encoder_capture_start(&enc, &src, 2560, 1440, NULL, 0) != 0);
+    assert(pins == 0 && !enc.scale_hw.transform && src.cap_fd == -1);
+    assert(closes == 2);
+    puts("capture teardown: drain previews, release all DMA-BUF borrowers (preview, snapshot, encoder scaler) before VIN, failed-open cleanup PASS");
     return 0;
 }
