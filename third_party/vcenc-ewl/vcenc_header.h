@@ -21,7 +21,8 @@
 #include <string.h>
 
 /* Shared with the color-info ABI. Both hardware programs use 8-bit Main
- * profiles; both emitted VUIs describe limited-range BT.709 output. */
+ * profiles; both emitted VUIs describe BT.709 output, limited range unless
+ * the caller passes the range its source produces. */
 #define VCENC_COMPONENT_BITS 8u
 #define VCENC_VIDEO_FULL_RANGE 0u
 
@@ -71,8 +72,9 @@ static uint32_t bw_finish(struct bitw *w, uint8_t *out)
 }
 
 /* Annex-B SPS NAL (start code included) for a progressive 4:2:0 stream.
- * Returns bytes written. */
-static uint32_t vcenc_write_sps_fps(uint8_t *out, uint32_t width, uint32_t height, uint32_t fps)
+ * full_range sets video_full_range_flag. Returns bytes written. */
+static uint32_t vcenc_write_sps_range(uint8_t *out, uint32_t width, uint32_t height,
+                                      uint32_t fps, uint32_t full_range)
 {
 	static const uint8_t sc[5] = { 0, 0, 0, 1, 0x67 };
 	uint32_t mbs_w = (width + 15) / 16, mbs_h = (height + 15) / 16;
@@ -120,11 +122,11 @@ static uint32_t vcenc_write_sps_fps(uint8_t *out, uint32_t width, uint32_t heigh
 	bw_u(&w, 1, 1);         /* vui_parameters_present_flag */
 	bw_u(&w, 0, 1);         /* aspect_ratio_info_present_flag */
 	bw_u(&w, 0, 1);         /* overscan_info_present_flag */
-	/* The HDMI bridge supplies limited-range BT.709 YUYV. Signal it for
-	 * every output size; decoder defaults can otherwise use BT.601. */
+	/* Signal the source's BT.709 range for every output size; decoder
+	 * defaults can otherwise use BT.601 or guess the range. */
 	bw_u(&w, 1, 1);         /* video_signal_type_present_flag */
 	bw_u(&w, 5, 3);         /* video_format: unspecified */
-	bw_u(&w, VCENC_VIDEO_FULL_RANGE, 1); /* video_full_range_flag */
+	bw_u(&w, full_range ? 1u : 0u, 1); /* video_full_range_flag */
 	bw_u(&w, 1, 1);         /* colour_description_present_flag */
 	bw_u(&w, 1, 8);         /* colour_primaries: BT.709 */
 	bw_u(&w, 1, 8);         /* transfer_characteristics: BT.709 */
@@ -145,6 +147,11 @@ static uint32_t vcenc_write_sps_fps(uint8_t *out, uint32_t width, uint32_t heigh
 
 	memcpy(out, sc, 5);
 	return 5 + bw_finish(&w, out + 5);
+}
+
+static inline uint32_t vcenc_write_sps_fps(uint8_t *out, uint32_t width, uint32_t height, uint32_t fps)
+{
+    return vcenc_write_sps_range(out, width, height, fps, VCENC_VIDEO_FULL_RANGE);
 }
 
 /* Annex-B PPS NAL. pic_init_qp must equal the register program's sw7 QP

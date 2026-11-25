@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 
 struct ax_frame_spec {
@@ -100,6 +101,9 @@ static uint8_t *ax_load_nv21(const struct ax_frame_spec *frame)
         free(nv21);
         nv21 = NULL;
     }
+    /* The frame is drawn once per switch; its page cache (3 MiB at 1080p)
+     * would otherwise stay charged to Core until memory pressure. */
+    (void)posix_fadvise(fileno(file), 0, 0, POSIX_FADV_DONTNEED);
     fclose(file);
     return nv21;
 }

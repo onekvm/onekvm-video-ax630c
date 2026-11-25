@@ -10,7 +10,7 @@
 static uint8_t snapshot[512], programmed[512];
 static size_t available, offset, chip_offset, written;
 static const char *chip = "lt7911exc\n";
-static int paused, writes, read_error;
+static int paused, writes, read_error, shadow, last_fd;
 
 int ax_edid_capture_begin(char *error, uint32_t capacity)
 {
@@ -20,7 +20,12 @@ int ax_edid_capture_begin(char *error, uint32_t capacity)
 void ax_edid_capture_end(void) { assert(paused); paused = 0; }
 int __wrap_access(const char *path, int mode)
 {
-    assert(mode == W_OK && !strcmp(path, "/proc/lt7911_info/edid"));
+    assert(mode == W_OK);
+    if (!strcmp(path, "/proc/lt7911_info/edid_shadow")) {
+        if (shadow) return 0;
+        errno = ENOENT; return -1;
+    }
+    assert(!strcmp(path, "/proc/lt7911_info/edid"));
     return 0;
 }
 int __wrap_open(const char *path, int flags, ...)
@@ -34,6 +39,9 @@ int __wrap_open(const char *path, int flags, ...)
         offset = 0; return 701;
     }
     assert(flags == (O_WRONLY | O_CLOEXEC) && paused);
+    if (!strcmp(path, "/proc/lt7911_info/edid_shadow")) {
+        assert(shadow); return 703;
+    }
     assert(!strcmp(path, "/proc/lt7911_info/edid"));
     return 702;
 }
@@ -53,11 +61,11 @@ ssize_t __wrap_read(int fd, void *data, size_t size)
 }
 ssize_t __wrap_write(int fd, const void *data, size_t size)
 {
-    assert(fd == 702 && paused && size <= sizeof(programmed));
-    memcpy(programmed, data, size); written = size; writes++;
+    assert((fd == 702 || fd == 703) && paused && size <= sizeof(programmed));
+    memcpy(programmed, data, size); written = size; writes++; last_fd = fd;
     return size;
 }
-int __wrap_close(int fd) { assert(fd >= 700 && fd <= 702); return 0; }
+int __wrap_close(int fd) { assert(fd >= 700 && fd <= 703); return 0; }
 
 static void make_edid(unsigned size)
 {
@@ -108,6 +116,23 @@ int main(void)
     chip = "lt7911exc\n";
     assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_TEMPORARY,
         &apply, error, sizeof(error)) != 0 && writes == before);
+    /* The driver's Shadow file enables temporary writes of any length. */
+    shadow = 1;
+    assert(ax_edid_capabilities(&caps) == 0 &&
+           (caps.flags & ONEKVM_VIDEO_EDID_CAP_TEMPORARY));
+    for (unsigned size = 128; size <= 512; size += 128) {
+        make_edid(size);
+        assert(ax_edid_get(&blob, error, sizeof(error)) == 0);
+        assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_TEMPORARY,
+            &apply, error, sizeof(error)) == 0);
+        assert(last_fd == 703 && written == size && !paused);
+        assert(ax_edid_set_mode(&blob, ONEKVM_VIDEO_EDID_WRITE_PERMANENT,
+            &apply, error, sizeof(error)) == 0 && last_fd == 702);
+    }
+    make_edid(256);
+    snapshot[127]++;
+    assert(ax_edid_capabilities(&caps) == 0 &&
+           !(caps.flags & ONEKVM_VIDEO_EDID_CAP_TEMPORARY));
 #endif
     puts("Go EDID block length, truncation and write checks passed");
     return 0;
