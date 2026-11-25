@@ -134,6 +134,8 @@ struct ax_source {
     uint64_t recover_after_ms;
     unsigned recovery_attempts, recovery_frames;
     int32_t output_resolution;
+    /* video_full_range_flag for live IDRs: configured or bridge range. */
+    atomic_uint full_range;
     atomic_int streaming;
     int held;
     uint32_t held_index;
@@ -153,6 +155,7 @@ struct ax_encoder {
     vcenc_geom geom;
     int have_geom;
     uint32_t codec;
+    uint32_t sps_full_range;
     atomic_uint color_info;
     uint32_t qp;
     struct ax_rate rate;
@@ -1144,10 +1147,14 @@ static uint32_t ax_write_parameter_sets(struct ax_encoder *enc, uint8_t *out)
     uint32_t fps = ax_effective_fps(enc->fps, enc->placeholder ? 5 :
                                    ax_nominal_fps(enc->bound ? enc->bound->fps : 60));
 
+    /* The no-signal placeholder is stored as limited-range YUYV. */
+    enc->sps_full_range = !enc->placeholder && enc->bound &&
+        atomic_load(&enc->bound->full_range);
     if (enc->codec == ONEKVM_VIDEO_CODEC_H265)
-        return vcenc_write_hevc_headers_fps(out, enc->geom.w, enc->geom.h, enc->rate.initial_qp,
-                                           vcenc_hevc_level_idc_fps(enc->geom.w, enc->geom.h, fps), fps);
-    size = vcenc_write_sps_fps(out, enc->geom.w, enc->geom.h, fps);
+        return vcenc_write_hevc_headers_range(out, enc->geom.w, enc->geom.h, enc->rate.initial_qp,
+                                              vcenc_hevc_level_idc_fps(enc->geom.w, enc->geom.h, fps),
+                                              fps, enc->sps_full_range);
+    size = vcenc_write_sps_range(out, enc->geom.w, enc->geom.h, fps, enc->sps_full_range);
     return size + vcenc_write_pps(out + size, enc->rate.initial_qp);
 }
 
@@ -1260,7 +1267,7 @@ static int ax_encode_yuyv(struct ax_encoder *enc, const uint8_t *yuyv,
     if (is_idr) {
         /* Published only after a successful AU with our actual SPS/VUI.
          * This describes the encoded stream, never the HDMI input depth. */
-        uint32_t range = VCENC_VIDEO_FULL_RANGE
+        uint32_t range = enc->sps_full_range
             ? ONEKVM_VIDEO_COLOR_RANGE_FULL : ONEKVM_VIDEO_COLOR_RANGE_LIMITED;
         atomic_store(&enc->color_info, VCENC_COMPONENT_BITS | (range << 8));
     }
@@ -1674,6 +1681,22 @@ static const char *ax_capture_device(const char *device)
     return strcmp(device, "/dev/video0") == 0 ? AX_CAP_DEV : device;
 }
 
+/* Signalled range: the configured one, or what the HDMI bridge outputs.
+ * Pixels are not converted. Older Core passes no color_range. */
+static uint32_t ax_config_full_range(const struct onekvm_video_source_config_v1 *config)
+{
+    uint32_t range = ONEKVM_VIDEO_COLOR_RANGE_UNKNOWN;
+
+    if (config->struct_size >= offsetof(struct onekvm_video_source_config_v1, color_range) +
+                               sizeof(config->color_range))
+        range = config->color_range;
+    if (range == ONEKVM_VIDEO_COLOR_RANGE_LIMITED)
+        return 0;
+    if (range == ONEKVM_VIDEO_COLOR_RANGE_FULL)
+        return 1;
+    return AX_BRIDGE_FULL_RANGE;
+}
+
 static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *config,
                                 void **source, char *error, uint32_t error_cap)
 {
@@ -1692,6 +1715,7 @@ static int32_t ax_source_create(const struct onekvm_video_source_config_v1 *conf
     snprintf(src->device, sizeof(src->device), "%s",
              ax_capture_device(config->device));
     src->output_resolution = config->resolution;
+    atomic_store(&src->full_range, ax_config_full_range(config));
     uint32_t w, h, fps;
     if (ax_hdmi_mode(&w, &h, &fps) == 0)
         ax_publish_input_mode(src, w, h, fps);
@@ -1742,6 +1766,7 @@ static int32_t ax_source_reset(void *source,
     snprintf(src->device, sizeof(src->device), "%s",
              ax_capture_device(config->device));
     src->output_resolution = config->resolution;
+    atomic_store(&src->full_range, ax_config_full_range(config));
     atomic_store(&src->interrupted, 0);
     atomic_store(&src->encoded_requested_ms, 0);
     pthread_mutex_unlock(&src->lock);
@@ -2614,6 +2639,7 @@ static const struct onekvm_video_backend_v1 ax_backend = {
                 ONEKVM_VIDEO_FEATURE_BOUND_ENCODER |
                 ONEKVM_VIDEO_FEATURE_LATENCY |
                 ONEKVM_VIDEO_FEATURE_EDID |
+                ONEKVM_VIDEO_FEATURE_SOURCE_COLOR_RANGE |
                 ONEKVM_VIDEO_FEATURE_BOUND_ENCODED_TIME |
                 ONEKVM_VIDEO_FEATURE_ENCODER_COLOR_INFO |
                 ONEKVM_VIDEO_FEATURE_SOURCE_SNAPSHOT |

@@ -120,8 +120,10 @@ static int bridge_flash_supported(const char *chip)
 static int bridge_shadow_supported(const char *chip)
 {
     uint8_t cached[EDID_BYTES];
-    return !strcmp(chip, "LT6911UXC") && access(EDID_SHADOW, W_OK) == 0 &&
-           read_snapshot(cached) == EDID_BYTES && valid_edid(cached, EDID_BYTES);
+    if (strcmp(chip, "LT6911UXC") && strcmp(chip, "LT7911EXC"))
+        return 0;
+    int size = access(EDID_SHADOW, W_OK) == 0 ? read_snapshot(cached) : -1;
+    return size > 0 && valid_edid(cached, (uint32_t)size);
 }
 
 int32_t ax_edid_capabilities(struct onekvm_video_edid_caps_v1 *caps)
@@ -174,7 +176,7 @@ static int32_t ax_edid_set_impl(const struct onekvm_video_edid_blob_v1 *edid,
         return edid_error(error, capacity, "EDID block count or checksum is invalid");
     const char *chip = bridge_chip();
     if (temporary && (!bridge_shadow_supported(chip)))
-        return edid_error(error, capacity, "temporary EDID requires a UXC Shadow interface");
+        return edid_error(error, capacity, "temporary EDID is not supported by this HDMI bridge");
     if (!bridge_flash_supported(chip) || (!temporary && access(EDID_DEVICE, W_OK)))
         return edid_error(error, capacity, "HDMI bridge EDID interface is unavailable");
     pthread_mutex_lock(&edid_update_lock);

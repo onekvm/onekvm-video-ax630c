@@ -16,7 +16,7 @@ CSI-2、VIN、VC8000E 与 TDP 驱动源码在 [`osdrv-ax620e`](../../../osdrv-ax
 
 首次从内置驱动切换到模块需要安装配套内核、模块和镜像身份信息并重启。后续驱动内部修复若不改变内核 ABI，可以针对已发布的固定内核构建和更新模块，无须替换内核镜像。内核配置、公共头文件、导出符号或 ABI 变化仍需要配套系统更新；模块化不等于允许跨内核构建混用。
 
-`ax630c_venc_v4l2` 单独打包为 `kernel-module-ax630c-venc-v4l2`，默认镜像不带、后端不依赖。它通过 `ax630c_venc_vcmd` 的内核接口提交命令，与 Core 的 `/dev/es_venc` 会话共享编码器时间片；1080p 单帧硬件编码约 6.6 ms。105 实测 Core 1080p60 与一路 1080p30 或 1080p60 V4L2 编码并发时，浏览器仍为 60 FPS、两路无错误；但编码器按命令缓冲先后执行，Core 一帧可能等完对方正在编的一帧。两路同为 60 FPS 时，按提交相位不同，Core 编码等待中位数在 6.6 ms 与 12.4 ms 之间。重载 `ax630c_venc_vcmd` 前先卸载它。
+`ax630c_venc_v4l2` 单独打包为 `kernel-module-ax630c-venc-v4l2`，默认镜像不带、后端不依赖。它通过 `ax630c_venc_vcmd` 的内核接口提交命令，与 Core 的 `/dev/es_venc` 会话共享编码器时间片。编码器按命令缓冲先后执行，Core 一帧可能等完另一会话正在编码的一帧。重载 `ax630c_venc_vcmd` 前先卸载它。
 
 模块加载顺序和重载可能改变 `/dev/videoN` 编号。启动助手按平台设备识别 VIN、TDP 与 Hantro，分别刷新 `/dev/onekvm-vin`、`/dev/onekvm-vproc`、`/dev/onekvm-vdec` 和解码器 media 别名；不能只检查旧别名仍指向字符设备。后端默认使用 VIN 别名，创建和重置采集源时均将历史 `/dev/video0` 配置映射到该别名，保留显式指定的其他设备路径。编码自动协商、配置重置等路径必须复用相同的映射，不能把采集节点覆盖回编号路径。重载后需重新执行 `onekvm-vdec.service` 的启动助手，再恢复消费者。
 
@@ -24,4 +24,4 @@ CSI-2、VIN、VC8000E 与 TDP 驱动源码在 [`osdrv-ax620e`](../../../osdrv-ax
 
 更新前停止 Core、小屏及其他视频消费者，确认释放设备和 DMA-BUF 引用。卸载时先停止使用方，再卸载采集、CSI 和桥片；重载时先桥片、CSI，再采集和编解码/转换模块。禁止强制卸载；出现 in-use 应检查未退出的消费者。更新后执行 depmod，再恢复消费者并验证真实画面、分辨率切换和 EDID 读取。
 
-模块 IPK 必须匹配目标系统 kernel release 与 magic，不能仅依据相同的 uname -r 复用。构建和打包仍走 onekvm-distro 的 Make/OE 入口，保留既有镜像与模块身份检查。实机卸载重载的具体记录保存在项目 artifacts，不作为所有机型和芯片都通过的保证。
+模块 IPK 必须匹配目标系统 kernel release 与 magic，不能仅依据相同的 uname -r 复用。构建和打包仍走 onekvm-distro 的 Make/OE 入口，保留既有镜像与模块身份检查。

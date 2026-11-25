@@ -98,9 +98,11 @@ static uint32_t vcenc_write_vps(uint8_t *out, uint32_t level_idc)
 	return 6 + bw_finish(&w, out + 6);
 }
 
-/* Annex-B SPS NAL for a progressive 4:2:0 8-bit stream of WxH (even). */
-static uint32_t vcenc_write_hevc_sps_fps(uint8_t *out, uint32_t width,
-				     uint32_t height, uint32_t level_idc, uint32_t fps)
+/* Annex-B SPS NAL for a progressive 4:2:0 8-bit stream of WxH (even).
+ * full_range sets video_full_range_flag. */
+static uint32_t vcenc_write_hevc_sps_range(uint8_t *out, uint32_t width,
+				     uint32_t height, uint32_t level_idc, uint32_t fps,
+				     uint32_t full_range)
 {
 	static const uint8_t sc[6] = { 0, 0, 0, 1, 0x42, 0x01 }; /* nal 33 */
 	uint32_t w8 = (width + 7) & ~7u, h8 = (height + 7) & ~7u;
@@ -157,7 +159,7 @@ static uint32_t vcenc_write_hevc_sps_fps(uint8_t *out, uint32_t width,
 	bw_u(&w, 0, 1);         /* overscan_info_present_flag */
 	bw_u(&w, 1, 1);         /* video_signal_type_present_flag */
 	bw_u(&w, 5, 3);         /* video_format: unspecified */
-	bw_u(&w, VCENC_VIDEO_FULL_RANGE, 1); /* video_full_range_flag */
+	bw_u(&w, full_range ? 1u : 0u, 1); /* video_full_range_flag */
 	bw_u(&w, 1, 1);         /* colour_description_present_flag */
 	bw_u(&w, 1, 8);         /* colour_primaries: BT.709 */
 	bw_u(&w, 1, 8);         /* transfer_characteristics */
@@ -184,6 +186,14 @@ static uint32_t vcenc_write_hevc_sps_fps(uint8_t *out, uint32_t width,
 	bw_u(&w, 0, 1);         /* sps_extension_present_flag */
 	memcpy(out, sc, 6);
 	return 6 + bw_finish(&w, out + 6);
+}
+
+static inline uint32_t vcenc_write_hevc_sps_fps(uint8_t *out, uint32_t width,
+                                                uint32_t height, uint32_t level_idc,
+                                                uint32_t fps)
+{
+    return vcenc_write_hevc_sps_range(out, width, height, level_idc, fps,
+                                      VCENC_VIDEO_FULL_RANGE);
 }
 
 /* Annex-B PPS NAL. pic_init_qp must equal the register program's frame QP. */
@@ -235,14 +245,23 @@ static uint32_t vcenc_write_hevc_pps(uint8_t *out, uint32_t pic_init_qp)
 }
 
 /* VPS+SPS+PPS for one IDR; returns bytes written (out >= 160 bytes). */
+static inline uint32_t vcenc_write_hevc_headers_range(uint8_t *out, uint32_t width,
+						uint32_t height, uint32_t qp,
+						uint32_t level_idc, uint32_t fps,
+						uint32_t full_range)
+{
+	uint32_t n = vcenc_write_vps(out, level_idc);
+	n += vcenc_write_hevc_sps_range(out + n, width, height, level_idc, fps, full_range);
+	n += vcenc_write_hevc_pps(out + n, qp);
+	return n;
+}
+
 static inline uint32_t vcenc_write_hevc_headers_fps(uint8_t *out, uint32_t width,
 						uint32_t height, uint32_t qp,
 						uint32_t level_idc, uint32_t fps)
 {
-	uint32_t n = vcenc_write_vps(out, level_idc);
-	n += vcenc_write_hevc_sps_fps(out + n, width, height, level_idc, fps);
-	n += vcenc_write_hevc_pps(out + n, qp);
-	return n;
+	return vcenc_write_hevc_headers_range(out, width, height, qp, level_idc, fps,
+					      VCENC_VIDEO_FULL_RANGE);
 }
 
 static inline uint32_t vcenc_write_hevc_headers(uint8_t *out, uint32_t width,

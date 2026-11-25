@@ -2,7 +2,8 @@
 /* Golden SPS/PPS syntax for the fixed-QP hardware slices. HEVC vectors
  * originate from vendor-diff-hevc-20260905/H3/fixqp32.h265; their VUI is
  * intentionally corrected to limited-range BT.709. H.264 signals the same
- * colour fields at HD and SD sizes, without changing its reorder bounds. */
+ * colour fields at HD and SD sizes, without changing its reorder bounds.
+ * A full-range source sets only video_full_range_flag. */
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -17,6 +18,29 @@ static int cmp(const char *what, const uint8_t *got, int gn, const char *hex)
 	if (!ok) { printf("  got :"); for (int i = 4; i < gn; i++) printf("%02x", got[i]); printf("\n  want:%s\n", hex); }
 	return !ok;
 }
+/* Full range changes only video_full_range_flag; limited matches the
+ * default writers byte for byte. */
+static int range_flips_one_bit(const char *what, int hevc)
+{
+	uint8_t def[256], lim[256], full[256];
+	int dn, ln, fn, bits = 0;
+
+	if (hevc) {
+		dn = vcenc_write_hevc_sps_fps(def, 1920, 1080, 153, 60);
+		ln = vcenc_write_hevc_sps_range(lim, 1920, 1080, 153, 60, 0);
+		fn = vcenc_write_hevc_sps_range(full, 1920, 1080, 153, 60, 1);
+	} else {
+		dn = vcenc_write_sps_fps(def, 1920, 1080, 60);
+		ln = vcenc_write_sps_range(lim, 1920, 1080, 60, 0);
+		fn = vcenc_write_sps_range(full, 1920, 1080, 60, 1);
+	}
+	for (int i = 0; i < ln && ln == fn; i++)
+		bits += __builtin_popcount(lim[i] ^ full[i]);
+	int ok = dn == ln && !memcmp(def, lim, dn) && ln == fn && bits == 1;
+	printf("%-16s %s\n", what, ok ? "MATCH" : "DIFF");
+	return !ok;
+}
+
 int main(void)
 {
 	uint8_t b[256]; int fails = 0, n;
@@ -39,6 +63,8 @@ int main(void)
 	fails += cmp("AVC SPS 480p", b, n, "674d001f8d8d60501ed35010101078442370");
 	n = vcenc_write_pps(b, 32);
 	fails += cmp("AVC PPS qp32", b, n, "68ee0672");
+	fails += range_flips_one_bit("AVC full range", 0);
+	fails += range_flips_one_bit("HEVC full range", 1);
 	uint8_t all[512]; n = vcenc_write_hevc_headers(all, 1920, 1080, 32, 153);
 	printf("headers 1080p qp32: %d bytes (vendor 92)\n", n);
 	printf("%s\n", fails ? "FAIL" : "PASS");

@@ -13,6 +13,8 @@ AX630C 后端包安装 `onekvm.service.d/20-ax630c-software-srtp.conf`，选择
 H.264/H.265 继续使用 VC8000E 硬件编码，缩放、预览和硬件解码不受此策略影响。
 本策略只取消硬件加密的应用接口，不移除内核 EIP-130 驱动或修改固件。
 
+EIP-130 硬件路径仍需通过 ioctl 提交及搬运数据，多个观看者共享加密引擎。当前后端沿用软件 AES-CM。
+
 下面是保留源码的历史实验约定，仅用于独立开发诊断；生产库不再提供这些接口，
 设备诊断包也不再安装依赖该 Crypto ABI 的 `ax630c-crypto-test`。
 
@@ -38,8 +40,7 @@ GCM 是部分硬件卸载，不声明 EIP-130 原生 GCM 或硬件 GHASH。
 不声明独立的硬件 `HMAC_SHA1` 能力；AES-CM 的认证在软件中完成。
 `AES_CM_TX_BATCH` 表示完整包的组合回调，允许部分硬件卸载。
 descriptor 的 `srtp-tx-offload` 与 `CONCURRENT_H265_VIDEO`
-用于 Core 的 H.264/H.265 SRTP TX；105 已通过浏览器 H.264 播放及 90 秒 H.265
-WebRTC/加密并发验证，接收 5427 帧，无序号缺口、完整码流解码零错误。
+用于 Core 的 H.264/H.265 SRTP TX。
 
 每个 session 由硬件计算 `H = AES_K(0)`。每个包的 `J0` 和递增 counter 组成一个
 连续的 ECB 输入，多个包合并提交，输出仅作为 AES keystream。OpenSSL 的 GCM
@@ -129,7 +130,7 @@ root 可向 `/sys/module/axera_eip130/parameters/fault_timeout_once` 写入 1，
 再输出同步请求微基准。`ax630c-eip130-ioctl-test` 验证原生 UAPI 的元数据、
 坏地址、错误后输出长度、原地处理与同一 fd 并发；显式传 `--fault` 才注入超时，
 验证保持隔离、拒绝后续请求及同一 fd 在受控恢复后继续工作。
-105 还通过禁止整个诊断进程及其线程使用 `socket()` 的 seccomp 验证，确认无需 AF_ALG。
+原生 ioctl 路径无需 AF_ALG。
 
 `onekvm-crypto-diag` 提供 `/usr/libexec/onekvm/onekvm-crypto-bench`：
 
@@ -150,5 +151,5 @@ onekvm-crypto-bench --mode hardware --payload 1200 --batch 8 --mbps 20 --seconds
 每次提交的固定成本；Python 自身开销不作为正式软硬件 CPU 对照。
 历史硬件实验要求验证实际 SRTP 接收、解密、视频解码和 H.265 并发；
 不能只凭进程 CPU 或单独加密吞吐声称音频总 CPU 达到 5%。
-105 的固定码率、饱和吞吐和整机 CPU 三轮对照见
+验证方法见
 [Pro 硬件加密](../../../onekvm-distro/docs/nanokvm-pro-crypto.md#验证与性能测量)。
